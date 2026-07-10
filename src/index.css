@@ -1,0 +1,224 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Tailwind v4 dark mode driven by a `.dark` class on <html>. */
+@custom-variant dark (&:is(.dark *));
+
+/* ------------------------------------------------------------------ *
+ * Design tokens
+ * Light + dark palettes. Accent is a premium violet; destructive is
+ * the strong red used by the "Off" state in the control panel.
+ * ------------------------------------------------------------------ */
+:root {
+  --radius: 0.75rem;
+
+  --background: hsl(0 0% 100%);
+  --foreground: hsl(224 24% 12%);
+
+  --card: hsl(0 0% 100%);
+  --card-foreground: hsl(224 24% 12%);
+
+  --popover: hsl(0 0% 100%);
+  --popover-foreground: hsl(224 24% 12%);
+
+  --primary: hsl(248 79% 65%);
+  --primary-foreground: hsl(0 0% 100%);
+
+  --secondary: hsl(240 6% 96%);
+  --secondary-foreground: hsl(224 20% 18%);
+
+  --muted: hsl(240 6% 96%);
+  --muted-foreground: hsl(240 4% 46%);
+
+  --accent: hsl(248 60% 97%);
+  --accent-foreground: hsl(248 60% 40%);
+
+  --destructive: hsl(351 74% 42%);
+  --destructive-foreground: hsl(0 0% 100%);
+
+  --success: hsl(152 60% 38%);
+  --success-foreground: hsl(0 0% 100%);
+
+  --warning: hsl(38 92% 50%);
+  --warning-foreground: hsl(0 0% 100%);
+
+  --border: hsl(240 6% 90%);
+  --input: hsl(240 6% 90%);
+  --ring: hsl(248 79% 65%);
+
+  /* Brand gradient stops (used for hero accents / recording pulse). */
+  --brand-from: hsl(255 85% 68%);
+  --brand-to: hsl(224 90% 62%);
+
+  /* Native window chrome */
+  --titlebar: hsl(0 0% 100%);
+  --scrollbar-thumb: hsl(240 5% 82%);
+}
+
+.dark {
+  --background: hsl(240 10% 6%);
+  --foreground: hsl(0 0% 98%);
+
+  --card: hsl(240 8% 9%);
+  --card-foreground: hsl(0 0% 98%);
+
+  --popover: hsl(240 9% 8%);
+  --popover-foreground: hsl(0 0% 98%);
+
+  --primary: hsl(250 84% 70%);
+  --primary-foreground: hsl(250 40% 10%);
+
+  --secondary: hsl(240 5% 14%);
+  --secondary-foreground: hsl(0 0% 96%);
+
+  --muted: hsl(240 5% 14%);
+  --muted-foreground: hsl(240 5% 62%);
+
+  --accent: hsl(248 40% 18%);
+  --accent-foreground: hsl(248 90% 88%);
+
+  --destructive: hsl(351 74% 46%);
+  --destructive-foreground: hsl(0 0% 100%);
+
+  --success: hsl(152 55% 45%);
+  --success-foreground: hsl(0 0% 100%);
+
+  --warning: hsl(38 92% 55%);
+  --warning-foreground: hsl(38 40% 10%);
+
+  --border: hsl(240 5% 16%);
+  --input: hsl(240 5% 18%);
+  --ring: hsl(250 84% 70%);
+
+  --brand-from: hsl(255 90% 74%);
+  --brand-to: hsl(224 92% 66%);
+
+  --titlebar: hsl(240 9% 8%);
+  --scrollbar-thumb: hsl(240 5% 24%);
+}
+
+/* Map tokens to Tailwind color utilities (bg-background, text-foreground, …) */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-brand-from: var(--brand-from);
+  --color-brand-to: var(--brand-to);
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system,
+    "Inter", "Helvetica Neue", Arial, sans-serif;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow: hidden; /* app manages its own scroll regions */
+    user-select: none; /* desktop-app feel; opt back in for text areas */
+  }
+
+  /* Allow selection where it matters (transcripts, editable text). */
+  .selectable,
+  input,
+  textarea,
+  [contenteditable="true"] {
+    user-select: text;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--scrollbar-thumb);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--muted-foreground);
+    background-clip: content-box;
+  }
+}
+
+@layer utilities {
+  .drag-region {
+    -webkit-app-region: drag;
+    app-region: drag;
+  }
+  .no-drag {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+  .text-gradient-brand {
+    background-image: linear-gradient(
+      120deg,
+      var(--brand-from),
+      var(--brand-to)
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .bg-brand {
+    background-image: linear-gradient(120deg, var(--brand-from), var(--brand-to));
+  }
+}
+
+/* Recording pulse used by the tray-panel status dot. */
+@keyframes rec-pulse {
+  0% {
+    box-shadow: 0 0 0 0 hsl(351 74% 50% / 0.6);
+  }
+  70% {
+    box-shadow: 0 0 0 8px hsl(351 74% 50% / 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 hsl(351 74% 50% / 0);
+  }
+}
+.animate-rec-pulse {
+  animation: rec-pulse 1.6s ease-out infinite;
+}

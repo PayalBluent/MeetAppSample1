@@ -1,0 +1,33 @@
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+
+# Build output
+dist
+dist-ssr
+*.local
+
+# Secrets — never commit real API keys (keep .env.example only)
+.env
+.env.local
+
+# Tauri / Rust
+src-tauri/target
+src-tauri/gen
+
+# Whisper models (large binaries — downloaded on demand)
+models/*.bin
+models/*.gguf
+
+# Recordings produced at runtime
+recordings/
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
