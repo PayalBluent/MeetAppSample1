@@ -36,8 +36,8 @@ summary, and action items — all in memory (no database, no cloud sync yet).
 
 | Concern | Choice | Why |
 | --- | --- | --- |
-| Microphone | [`cpal`](https://crates.io/crates/cpal) + [`hound`](https://crates.io/crates/hound) | Reliable cross-platform capture; 32-bit float WAV. Default feature. |
-| System (loopback) audio | [`wasapi`](https://crates.io/crates/wasapi) | `cpal` doesn’t cleanly expose WASAPI loopback; `wasapi` has first-class support. Opt-in. |
+| Microphone + system audio (Windows) | [`wasapi`](https://crates.io/crates/wasapi) + [`hound`](https://crates.io/crates/hound) | Safe, maintained WASAPI bindings. One code path captures the mic (default capture device) and system output (default render device → loopback), with shared-mode format auto-conversion to a fixed 48 kHz f32 stereo stream. Always on for Windows. |
+| Microphone (other platforms) | [`cpal`](https://crates.io/crates/cpal) | Reliable cross-platform capture; used off-Windows and as a Windows last-resort fallback. |
 | Screen + video | [`windows-capture`](https://crates.io/crates/windows-capture) | Fastest Windows capture, HW-accelerated encoder, Graphics.Capture API. Opt-in. |
 | Transcription | [`whisper-rs`](https://crates.io/crates/whisper-rs) behind a `Transcriber` trait | Most-used whisper.cpp binding. Trait lets the app run without the heavy ML build and swap backends. Opt-in. |
 | Meeting detection | [`sysinfo`](https://crates.io/crates/sysinfo) + Win32 window titles | Process scan + window titles to catch browser meetings (Google Meet). |
@@ -119,11 +119,13 @@ npm run app:dev -- --features screen-capture
 npm run app:dev -- --features whisper
 ```
 
-> **Note on capture completeness.** The default build records the **microphone**
-> to WAV. `system-audio` reserves the WASAPI-loopback dependency and trait seam for
-> mixing in system output; wiring the loopback stream into the recorder is the next
-> step. `screen-capture` and `whisper` are functional but experimental and may need
-> minor version alignment on first build.
+> **Note on capture completeness.** On Windows the default build captures **both**
+> the microphone and system output and mixes them into a 48 kHz stereo WAV, using
+> the [`wasapi`](https://crates.io/crates/wasapi) crate (the mic is the default
+> capture device; system audio is the default render device via loopback). The
+> `system-audio` Cargo feature is therefore now a no-op kept only for compatibility.
+> `screen-capture` and `whisper` are functional but experimental and may need minor
+> version alignment on first build.
 
 ### On-device transcription (whisper)
 

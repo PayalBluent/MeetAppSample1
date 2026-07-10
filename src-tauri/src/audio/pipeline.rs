@@ -99,6 +99,22 @@ fn run(
     if let Err(e) = writer.finalize() {
         tracing::error!("audio pipeline: failed to finalize WAV {path:?}: {e}");
     }
+
+    // Verify (in the log) that each source actually delivered non-zero audio.
+    let verdict = |peak: f32, packets: u64| -> &'static str {
+        if packets == 0 {
+            "NO PACKETS"
+        } else if peak <= 0.0 {
+            "SILENT (all zero)"
+        } else {
+            "audio OK"
+        }
+    };
+    tracing::info!(
+        "recording finalized {path:?}: mic[{} pkts, peak={:.4} -> {}], system[{} pkts, peak={:.4} -> {}]",
+        mic.packets, mic.peak, verdict(mic.peak, mic.packets),
+        sys.packets, sys.peak, verdict(sys.peak, sys.packets),
+    );
 }
 
 /// Process one packet through level → VAD → labeling → resample stages.
@@ -180,6 +196,10 @@ struct Channel {
     q: VecDeque<f32>,
     /// Whether the first packet has been seen (used to align channels in time).
     primed: bool,
+    /// Loudest block RMS seen — used at finalize to verify non-zero audio and
+    /// how many packets actually arrived on this source.
+    peak: f32,
+    packets: u64,
 }
 
 impl Channel {
@@ -191,6 +211,8 @@ impl Channel {
             resampler: None,
             q: VecDeque::new(),
             primed: false,
+            peak: 0.0,
+            packets: 0,
         }
     }
 
@@ -198,6 +220,10 @@ impl Channel {
         let mono = downmix(&pkt.samples, pkt.channels);
         let level = rms(&mono);
         self.level.store((level * 3.0).min(1.0).to_bits(), Ordering::Relaxed);
+        self.packets += 1;
+        if level > self.peak {
+            self.peak = level;
+        }
 
         let speaking = self.vad.update(level);
         self.seg.update(speaking, now_ms, segs);
@@ -352,6 +378,60 @@ mod tests {
         let mut out = VecDeque::new();
         rs.process(&[0.1, 0.2, 0.3], &mut out);
         assert_eq!(out.len(), 3);
+    }
+
+    /// Hardware-independent proof that the writer pipeline preserves audio: feed
+    /// synthetic non-zero PCM and confirm the finalized WAV contains non-zero
+    /// samples (rules out the pipeline/encoder silently zeroing the recording).
+    #[test]
+    fn pipeline_writes_nonzero_audio() {
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("pipeline-nonzero.wav");
+        let _ = std::fs::remove_file(&path);
+
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        let handle = spawn(
+            rx,
+            &path,
+            start,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .expect("pipeline should start");
+
+        // 1 s of a loud sine on the microphone source, in 480-sample packets.
+        for chunk in 0..100 {
+            let samples: Vec<f32> = (0..480)
+                .map(|i| {
+                    let n = (chunk * 480 + i) as f32;
+                    (n * 0.06).sin() * 0.5
+                })
+                .collect();
+            tx.send(AudioPacket {
+                timestamp: Instant::now(),
+                sample_rate: 48_000,
+                channels: 1,
+                samples,
+                source: AudioSource::Microphone,
+            })
+            .unwrap();
+        }
+        drop(tx); // disconnect -> pipeline finalizes
+        handle.join().unwrap();
+
+        let reader = hound::WavReader::open(&path).expect("WAV should exist");
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        let peak = reader
+            .into_samples::<i16>()
+            .filter_map(Result::ok)
+            .map(|s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 1000, "WAV must contain non-zero audio, peak={peak}");
     }
 
     #[test]

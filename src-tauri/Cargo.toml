@@ -40,8 +40,9 @@ sysinfo = "0.33"
 # WAV encoding (used by every capture backend).
 hound = "3"
 
-# Microphone capture (fallback / non-Windows).
-cpal = { version = "0.15", optional = true }
+# Microphone + speaker (loopback) capture. 0.16 exposes WASAPI/CoreAudio loopback
+# by building an input stream on the default output device.
+cpal = "0.16"
 
 # AI noise suppression — RNNoise (pure-Rust port, MIT). Default backend;
 # a DeepFilterNet backend can be added later behind another feature.
@@ -73,6 +74,8 @@ windows = { version = "0.58", features = [
 ] }
 # The `#[implement]` macro expands to `windows_core::` paths, so windows-core must
 # be a direct dependency (same version the umbrella `windows` crate re-exports).
+# (Retained for the `audio_diag` example's raw probes; the capture pipeline itself
+# no longer hand-rolls WASAPI — see `wasapi` below.)
 windows-core = "0.58"
 
 # Desktop-only plugins. Uses a Cargo-understood target cfg (not the tauri-only
@@ -87,8 +90,10 @@ tauri-plugin-autostart = "2"
 # built-in transcription/summary pipeline. Heavier native backends are opt-in.
 default = ["mic-capture", "denoise"]
 
-# Microphone capture via cpal (fallback / non-Windows).
-mic-capture = ["dep:cpal"]
+# cpal is now a non-optional dependency; this feature is retained as a no-op so
+# older build invocations and the existing `#[cfg(feature = "mic-capture")]`
+# gates keep working.
+mic-capture = []
 
 # System (loopback) + mic capture is compiled unconditionally on Windows (WASAPI,
 # see the `wasapi` windows-target dependency) — no feature flag needed. This

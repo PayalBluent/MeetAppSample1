@@ -26,7 +26,8 @@ use windows::Win32::Media::Audio::{
     IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
     IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
     AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
@@ -402,29 +403,41 @@ unsafe fn setup_endpoint_loopback() -> Result<CaptureStream, Box<dyn std::error:
 
 // ------------------------------------------------------------- capture endpoint
 
-/// Open the default microphone as a raw WASAPI capture endpoint (polled, shared
-/// mode, native mix format). Used when cpal can't open the input device.
+/// Open the default microphone. Tries shared mode first (the normal case), then
+/// falls back to **exclusive mode** — which bypasses the shared audio engine and
+/// succeeds on machines whose shared-mode path rejects `Initialize` with
+/// E_INVALIDARG.
 unsafe fn setup_capture_endpoint() -> Result<CaptureStream, Box<dyn std::error::Error>> {
     let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
         .map_err(|e| format!("CoCreateInstance: {e}"))?;
     let device: IMMDevice = enumerator
         .GetDefaultAudioEndpoint(eCapture, eCommunications)
         .map_err(|e| format!("GetDefaultAudioEndpoint(capture): {e}"))?;
-    let client: IAudioClient = device
-        .Activate(CLSCTX_ALL, None)
-        .map_err(|e| format!("Activate: {e}"))?;
 
+    match setup_capture_shared(&device) {
+        Ok(s) => {
+            tracing::info!("microphone: shared-mode capture");
+            Ok(s)
+        }
+        Err(e) => {
+            tracing::warn!("microphone: shared-mode failed ({e}); trying exclusive mode");
+            let s = setup_capture_exclusive(&device)?;
+            tracing::info!("microphone: exclusive-mode capture");
+            Ok(s)
+        }
+    }
+}
+
+/// Shared-mode capture using the device mix format.
+unsafe fn setup_capture_shared(device: &IMMDevice) -> Result<CaptureStream, Box<dyn std::error::Error>> {
+    let client: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| format!("Activate: {e}"))?;
     let pformat = client.GetMixFormat().map_err(|e| format!("GetMixFormat: {e}"))?;
     let wfx = ptr::read_unaligned(pformat);
     let channels = wfx.nChannels;
     let sample_rate = wfx.nSamplesPerSec;
     let block_align = wfx.nBlockAlign as usize;
     let format_tag = wfx.wFormatTag;
-    let bytes_per_sample = if channels > 0 {
-        block_align / channels as usize
-    } else {
-        0
-    };
+    let bytes_per_sample = if channels > 0 { block_align / channels as usize } else { 0 };
     let is_float = match format_tag {
         WAVE_FORMAT_IEEE_FLOAT => true,
         WAVE_FORMAT_EXTENSIBLE => {
@@ -438,14 +451,10 @@ unsafe fn setup_capture_endpoint() -> Result<CaptureStream, Box<dyn std::error::
         CoTaskMemFree(Some(pformat as *const c_void));
         return Err("capture endpoint: invalid mix format".into());
     }
-
-    // Plain shared-mode capture (no loopback flag), polled like endpoint loopback.
     let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, pformat, None);
     CoTaskMemFree(Some(pformat as *const c_void));
-    init.map_err(|e| format!("Initialize: {e}"))?;
-
+    init.map_err(|e| format!("shared Initialize: {e}"))?;
     let capture: IAudioCaptureClient = client.GetService()?;
-
     Ok(CaptureStream {
         client,
         capture,
@@ -454,6 +463,68 @@ unsafe fn setup_capture_endpoint() -> Result<CaptureStream, Box<dyn std::error::
         bytes_per_sample,
         is_float,
         sample_rate,
+        source: AudioSource::Microphone,
+    })
+}
+
+/// Exclusive-mode capture with a hand-built 16-bit PCM format. Event-driven, with
+/// the mandatory buffer-alignment retry.
+unsafe fn setup_capture_exclusive(device: &IMMDevice) -> Result<CaptureStream, Box<dyn std::error::Error>> {
+    // AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED — the format is accepted, only the buffer
+    // size needs re-aligning; retry once with the size the engine reports.
+    const NOT_ALIGNED: windows::core::HRESULT = windows::core::HRESULT(0x8889_0019u32 as i32);
+    let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    let format = pcm_format(CAPTURE_RATE, 2, 16);
+
+    // Buffer duration = the device minimum period.
+    let mut default_period = 0i64;
+    let mut min_period = 0i64;
+    {
+        let probe: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| format!("Activate: {e}"))?;
+        probe
+            .GetDevicePeriod(Some(&mut default_period), Some(&mut min_period))
+            .map_err(|e| format!("GetDevicePeriod: {e}"))?;
+    }
+    if min_period <= 0 {
+        min_period = 30_000; // 3 ms fallback
+    }
+
+    let mut client: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| format!("Activate: {e}"))?;
+    let mut dur = min_period;
+    let mut init = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, dur, dur, &format, None);
+
+    if let Err(e) = &init {
+        if e.code() == NOT_ALIGNED {
+            let frames = client.GetBufferSize().map_err(|e| format!("GetBufferSize: {e}"))?;
+            // Aligned duration (hns) for the reported buffer frame count.
+            dur = ((10_000.0 * 1_000.0 / CAPTURE_RATE as f64) * frames as f64 + 0.5) as i64;
+            client = device.Activate(CLSCTX_ALL, None).map_err(|e| format!("Activate: {e}"))?;
+            init = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, dur, dur, &format, None);
+        }
+    }
+    init.map_err(|e| format!("exclusive Initialize: {e}"))?;
+
+    let event = CreateEventW(None, false, false, PCWSTR::null())?;
+    if let Err(e) = client.SetEventHandle(event) {
+        let _ = CloseHandle(event);
+        return Err(e.into());
+    }
+    let capture: IAudioCaptureClient = match client.GetService() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = CloseHandle(event);
+            return Err(e.into());
+        }
+    };
+
+    Ok(CaptureStream {
+        client,
+        capture,
+        event: Some(event),
+        channels: 2,
+        bytes_per_sample: 2,
+        is_float: false,
+        sample_rate: CAPTURE_RATE,
         source: AudioSource::Microphone,
     })
 }

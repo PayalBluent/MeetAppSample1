@@ -6,6 +6,7 @@ mod error;
 mod events;
 mod models;
 mod platform;
+mod recorder;
 mod state;
 mod tray;
 
@@ -52,6 +53,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
+        .manage(recorder::RecorderState::default())
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -109,6 +111,8 @@ pub fn run() {
             commands::transcribe_meeting,
             commands::summarize_meeting,
             commands::open_recordings_folder,
+            recorder::start_recording,
+            recorder::stop_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MeetApp");
