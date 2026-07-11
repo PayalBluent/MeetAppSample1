@@ -44,6 +44,38 @@ impl Default for RecorderStatus {
     }
 }
 
+/// Result of probing the Windows shared-mode audio engine, streamed to the UI so
+/// it can offer the "Repair audio" action when shared mode is impaired.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioHealth {
+    /// False on non-Windows platforms (the shared-mode APO issue is Windows-only).
+    pub supported: bool,
+    /// Shared-mode `IAudioClient::Initialize` succeeds — the normal, healthy path
+    /// every recorder (and conferencing app) uses.
+    pub shared_ok: bool,
+    /// Exclusive-mode capture works — the mic can still be recorded (with the
+    /// meeting-app conflict trade-off) even when shared mode is broken.
+    pub exclusive_ok: bool,
+    /// Shared mode is impaired but the machine is otherwise healthy — recommend the
+    /// one-click repair (disable the broken enhancement + restart Windows Audio).
+    pub needs_repair: bool,
+    /// Human-readable one-line summary for the UI.
+    pub detail: String,
+}
+
+impl Default for AudioHealth {
+    fn default() -> Self {
+        AudioHealth {
+            supported: false,
+            shared_ok: false,
+            exclusive_ok: false,
+            needs_repair: false,
+            detail: String::new(),
+        }
+    }
+}
+
 /// A meeting the detector currently believes is in progress.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

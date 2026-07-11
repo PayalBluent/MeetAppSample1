@@ -104,6 +104,9 @@ pub fn start(
     // always reports no retained audio — `saves_audio()` already excludes it.)
     meeting.has_audio = mode.saves_audio() && meeting.audio_path.is_some();
     let audio_unavailable = mode != CaptureMode::Off && capture.is_none();
+    // The mic falls back to exclusive mode on machines whose shared audio engine is
+    // impaired; that works, but seizes the device from conferencing apps — warn.
+    let mic_exclusive = capture.as_ref().map(|c| c.mic_exclusive()).unwrap_or(false);
 
     let meeting_id = meeting.id.clone();
     state
@@ -121,6 +124,13 @@ pub fn start(
             Some(
                 "Couldn't open any audio input — check your microphone and Windows \
                  privacy settings. Recording without audio."
+                    .into(),
+            )
+        } else if mic_exclusive {
+            Some(
+                "Recording the microphone in exclusive mode because Windows shared \
+                 audio is impaired on this PC. Other apps (Zoom/Teams) may lose the \
+                 microphone while recording — open Settings › Audio to repair it."
                     .into(),
             )
         } else {

@@ -154,6 +154,20 @@ export interface RecorderStatus {
   message?: string | null;
 }
 
+/** Health of the Windows shared-mode audio engine (see `audio_health` command). */
+export interface AudioHealth {
+  /** False on non-Windows platforms (the shared-mode APO issue is Windows-only). */
+  supported: boolean;
+  /** Shared-mode capture works — the normal, healthy path. */
+  sharedOk: boolean;
+  /** Exclusive-mode mic works — capture still possible even if shared mode is broken. */
+  exclusiveOk: boolean;
+  /** Shared mode is impaired; the one-click repair is recommended. */
+  needsRepair: boolean;
+  /** Human-readable one-line summary. */
+  detail: string;
+}
+
 /** Event payloads emitted by the Rust backend (see `src-tauri/src/events.rs`). */
 export interface AppEvents {
   "meeting://detected": DetectedMeeting;

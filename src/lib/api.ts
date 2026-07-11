@@ -1,4 +1,5 @@
 import type {
+  AudioHealth,
   CaptureMode,
   DetectedMeeting,
   Meeting,
@@ -59,6 +60,13 @@ export const api = {
     invoke<Meeting>("summarize_meeting", { id }),
 
   openRecordingsFolder: () => invoke<void>("open_recordings_folder"),
+
+  /** Probe the Windows shared-mode audio engine (healthy vs. needs repair). */
+  audioHealth: () => invoke<AudioHealth>("audio_health"),
+  /** Disable the broken audio enhancement + restart Windows Audio (elevated). */
+  repairAudio: () => invoke<string>("repair_audio"),
+  /** Open the classic Windows Sound control panel for the manual fix. */
+  openSoundSettings: () => invoke<void>("open_sound_settings"),
 };
 
 export type Api = typeof api;

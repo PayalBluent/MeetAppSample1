@@ -226,6 +226,24 @@ class MockBackend {
     open_recordings_folder: (): void => {
       console.info("[mock] open_recordings_folder", this.settings.saveDirectory);
     },
+
+    audio_health: () => ({
+      supported: true,
+      sharedOk: true,
+      exclusiveOk: true,
+      needsRepair: false,
+      detail:
+        "Shared-mode audio is healthy — the microphone and system audio record normally.",
+    }),
+
+    repair_audio: (): string => {
+      console.info("[mock] repair_audio");
+      return "Audio repair launched (mock).";
+    },
+
+    open_sound_settings: (): void => {
+      console.info("[mock] open_sound_settings");
+    },
   };
 
   // ------------------------------------------------------------- simulation

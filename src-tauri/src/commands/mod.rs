@@ -5,8 +5,8 @@ use crate::core::recorder;
 use crate::error::{AppError, AppResult};
 use crate::events::Events;
 use crate::models::{
-    CaptureMode, DetectedMeeting, Meeting, MeetingPlatform, MeetingStatus, RecorderState,
-    RecorderStatus, Settings, SettingsPatch,
+    AudioHealth, CaptureMode, DetectedMeeting, Meeting, MeetingPlatform, MeetingStatus,
+    RecorderState, RecorderStatus, Settings, SettingsPatch,
 };
 use crate::state::AppState;
 
@@ -256,6 +256,55 @@ pub async fn summarize_meeting(
     })
     .await
     .map_err(|e| AppError::Other(format!("summarization task failed: {e}")))?
+}
+
+// ------------------------------------------------------------- audio health
+
+/// Probe whether the Windows shared-mode audio engine is healthy, so the UI can
+/// offer a one-click repair when a broken enhancement is blocking capture.
+#[tauri::command]
+pub fn audio_health() -> AudioHealth {
+    #[cfg(windows)]
+    {
+        crate::platform::windows::audio_repair::probe()
+    }
+    #[cfg(not(windows))]
+    {
+        AudioHealth {
+            supported: false,
+            detail: "Audio repair is only needed on Windows.".into(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Disable the broken audio enhancement on the default endpoints and restart
+/// Windows Audio (elevated via UAC). Reversible; installs nothing.
+#[tauri::command]
+pub fn repair_audio() -> AppResult<String> {
+    #[cfg(windows)]
+    {
+        crate::platform::windows::audio_repair::repair().map_err(AppError::Other)
+    }
+    #[cfg(not(windows))]
+    {
+        Err(AppError::Other(
+            "Audio repair is only available on Windows.".into(),
+        ))
+    }
+}
+
+/// Open the classic Windows Sound control panel for the manual enhancement toggle.
+#[tauri::command]
+pub fn open_sound_settings() -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        crate::platform::windows::audio_repair::open_sound_settings().map_err(AppError::Other)
+    }
+    #[cfg(not(windows))]
+    {
+        Err(AppError::Other("Only available on Windows.".into()))
+    }
 }
 
 #[tauri::command]

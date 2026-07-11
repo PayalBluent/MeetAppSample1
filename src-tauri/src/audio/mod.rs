@@ -70,6 +70,10 @@ pub struct Recorder {
     mic_level: Arc<AtomicU32>,
     sys_level: Arc<AtomicU32>,
     segments: Arc<Mutex<Vec<SpeakerSegment>>>,
+    /// True when the microphone opened in exclusive mode (shared audio is impaired
+    /// on this machine). Surfaced to the UI so it can warn about the conflict with
+    /// conferencing apps that exclusive mode implies.
+    mic_exclusive: bool,
 }
 
 impl Recorder {
@@ -85,7 +89,10 @@ impl Recorder {
         let (tx, rx) = mpsc::channel::<AudioPacket>();
         let start = Instant::now();
 
-        let mic_join = capture::spawn_microphone(tx.clone(), stop.clone());
+        let (mic_join, mic_exclusive) = match capture::spawn_microphone(tx.clone(), stop.clone()) {
+            Some((h, exclusive)) => (Some(h), exclusive),
+            None => (None, false),
+        };
         let system_join = if capture_system {
             capture::spawn_system_audio(tx.clone(), stop.clone())
         } else {
@@ -137,7 +144,13 @@ impl Recorder {
             mic_level,
             sys_level,
             segments,
+            mic_exclusive,
         })
+    }
+
+    /// Whether the microphone opened in exclusive mode (see [`Recorder::mic_exclusive`]).
+    pub fn mic_exclusive(&self) -> bool {
+        self.mic_exclusive
     }
 
     /// Current microphone input level, 0..1.

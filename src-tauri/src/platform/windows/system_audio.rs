@@ -59,13 +59,19 @@ enum StreamKind {
 /// Start system-audio (loopback) capture on a dedicated thread, sending packets
 /// to `tx`. Blocks until the stream is running; returns the thread handle or `None`.
 pub fn start(tx: Sender<AudioPacket>, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
-    start_with(tx, stop, StreamKind::System, "meetapp-system-audio")
+    start_with(tx, stop, StreamKind::System, "meetapp-system-audio").map(|(join, _)| join)
 }
 
 /// Start microphone capture through a raw WASAPI capture endpoint. This is the
-/// fallback the mic uses when cpal can't open the default input device.
-pub fn start_microphone(tx: Sender<AudioPacket>, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+/// fallback the mic uses when cpal can't open the default input device. Returns
+/// the capture thread plus `exclusive = true` when it had to open the device in
+/// exclusive mode (so the UI can warn about the meeting-app conflict that implies).
+pub fn start_microphone(
+    tx: Sender<AudioPacket>,
+    stop: Arc<AtomicBool>,
+) -> Option<(JoinHandle<()>, bool)> {
     start_with(tx, stop, StreamKind::Microphone, "meetapp-wasapi-mic")
+        .map(|(join, info)| (join, info.exclusive))
 }
 
 fn start_with(
@@ -73,8 +79,8 @@ fn start_with(
     stop: Arc<AtomicBool>,
     kind: StreamKind,
     thread_name: &str,
-) -> Option<JoinHandle<()>> {
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+) -> Option<(JoinHandle<()>, CaptureInfo)> {
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<CaptureInfo, String>>();
     let join = std::thread::Builder::new()
         .name(thread_name.into())
         .spawn(move || {
@@ -84,8 +90,10 @@ fn start_with(
         })
         .ok()?;
 
-    match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(())) => Some(join),
+    // Setup can now include format negotiation + a short delivery check, so allow
+    // a little longer than a plain Initialize would need.
+    match ready_rx.recv_timeout(Duration::from_secs(12)) {
+        Ok(Ok(info)) => Some((join, info)),
         Ok(Err(e)) => {
             tracing::warn!("WASAPI capture unavailable ({thread_name}): {e}");
             let _ = join.join();
@@ -101,7 +109,7 @@ fn start_with(
 fn run(
     stop: &AtomicBool,
     tx: &Sender<AudioPacket>,
-    ready: &mpsc::Sender<Result<(), String>>,
+    ready: &mpsc::Sender<Result<CaptureInfo, String>>,
     kind: StreamKind,
 ) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
@@ -125,7 +133,22 @@ fn run(
         };
 
         stream.client.Start()?;
-        let _ = ready.send(Ok(()));
+
+        // For the microphone, confirm the callback actually delivers PCM before we
+        // report success. A stream can initialize yet never fire — that used to
+        // look like a working mic and record silence; instead we now fail so the
+        // caller falls through to the next path (e.g. cpal). Loopback is exempt: it
+        // legitimately delivers nothing while the speakers are idle.
+        if matches!(kind, StreamKind::Microphone)
+            && !validate_capture(&stream, tx, Duration::from_millis(1500))
+        {
+            let _ = stream.client.Stop();
+            return Err("capture endpoint opened but delivered no PCM".into());
+        }
+
+        let _ = ready.send(Ok(CaptureInfo {
+            exclusive: stream.exclusive,
+        }));
 
         pump(&stream, stop, tx);
 
@@ -147,6 +170,17 @@ struct CaptureStream {
     sample_rate: u32,
     /// Which logical source this stream feeds (mic vs system).
     source: AudioSource,
+    /// True when the mic was opened in exclusive mode (bypasses the shared audio
+    /// engine, so it works on machines with a broken shared-mode enhancement — but
+    /// seizes the device, so other apps may lose it). Always false for loopback.
+    exclusive: bool,
+}
+
+/// What a started stream reports back to the caller.
+#[derive(Clone, Copy)]
+struct CaptureInfo {
+    /// The stream is a microphone opened in exclusive mode (see `CaptureStream`).
+    exclusive: bool,
 }
 
 impl Drop for CaptureStream {
@@ -217,6 +251,73 @@ unsafe fn pump(stream: &CaptureStream, stop: &AtomicBool, tx: &Sender<AudioPacke
             let _ = stream.capture.ReleaseBuffer(frames);
         }
     }
+}
+
+/// Pull packets for up to `timeout`, forwarding any read, and return `true` as
+/// soon as one real (non-empty) buffer arrives. Used to confirm a microphone
+/// endpoint truly delivers PCM before we commit to it — a silent buffer still
+/// counts (the device is producing frames), so a quiet or muted mic is not a
+/// false negative; only a stream that delivers *nothing* fails.
+unsafe fn validate_capture(
+    stream: &CaptureStream,
+    tx: &Sender<AudioPacket>,
+    timeout: Duration,
+) -> bool {
+    let silent_flag = AUDCLNT_BUFFERFLAGS_SILENT.0 as u32;
+    let frame_bytes = stream.channels as usize * stream.bytes_per_sample;
+    if frame_bytes == 0 {
+        return false;
+    }
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match stream.event {
+            Some(h) => {
+                let _ = WaitForSingleObject(h, 100);
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+        loop {
+            let packet_frames = match stream.capture.GetNextPacketSize() {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            if packet_frames == 0 {
+                break;
+            }
+            let mut pdata: *mut u8 = ptr::null_mut();
+            let mut frames: u32 = 0;
+            let mut flags: u32 = 0;
+            if stream
+                .capture
+                .GetBuffer(&mut pdata, &mut frames, &mut flags, None, None)
+                .is_err()
+            {
+                return false;
+            }
+            let delivered = frames > 0 && !pdata.is_null();
+            if delivered {
+                let timestamp = Instant::now();
+                let samples = if flags & silent_flag != 0 {
+                    vec![0.0f32; frames as usize * stream.channels as usize]
+                } else {
+                    let bytes = std::slice::from_raw_parts(pdata, frames as usize * frame_bytes);
+                    decode_interleaved(bytes, stream.bytes_per_sample, stream.is_float)
+                };
+                let _ = tx.send(AudioPacket {
+                    timestamp,
+                    sample_rate: stream.sample_rate,
+                    channels: stream.channels,
+                    samples,
+                    source: stream.source,
+                });
+            }
+            let _ = stream.capture.ReleaseBuffer(frames);
+            if delivered {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ------------------------------------------------------------- process loopback
@@ -336,6 +437,7 @@ unsafe fn setup_process_loopback() -> Result<CaptureStream, Box<dyn std::error::
         is_float: false,
         sample_rate: CAPTURE_RATE,
         source: AudioSource::System,
+        exclusive: false,
     })
 }
 
@@ -398,6 +500,7 @@ unsafe fn setup_endpoint_loopback() -> Result<CaptureStream, Box<dyn std::error:
         is_float,
         sample_rate,
         source: AudioSource::System,
+        exclusive: false,
     })
 }
 
@@ -464,69 +567,118 @@ unsafe fn setup_capture_shared(device: &IMMDevice) -> Result<CaptureStream, Box<
         is_float,
         sample_rate,
         source: AudioSource::Microphone,
+        exclusive: false,
     })
 }
 
-/// Exclusive-mode capture with a hand-built 16-bit PCM format. Event-driven, with
-/// the mandatory buffer-alignment retry.
+/// Exclusive-mode capture. Exclusive mode bypasses the shared audio engine (and
+/// any broken enhancement/APO living in it), so it succeeds on machines whose
+/// shared-mode `Initialize` returns E_INVALIDARG — but it requires a format the
+/// hardware *natively* supports, so we negotiate across the device's native format
+/// and common PCM formats rather than assuming 48 kHz stereo (which is why the old
+/// hard-coded format only worked on machines whose mic happened to match it).
+/// Event-driven, with the mandatory buffer-alignment retry per candidate.
 unsafe fn setup_capture_exclusive(device: &IMMDevice) -> Result<CaptureStream, Box<dyn std::error::Error>> {
     // AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED — the format is accepted, only the buffer
     // size needs re-aligning; retry once with the size the engine reports.
     const NOT_ALIGNED: windows::core::HRESULT = windows::core::HRESULT(0x8889_0019u32 as i32);
     let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-    let format = pcm_format(CAPTURE_RATE, 2, 16);
 
-    // Buffer duration = the device minimum period.
-    let mut default_period = 0i64;
-    let mut min_period = 0i64;
-    {
+    // The device's native (mix) rate/channels is the format most likely to be
+    // accepted in exclusive mode; read it so we try it first.
+    let (native_rate, native_ch) = {
         let probe: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| format!("Activate: {e}"))?;
-        probe
-            .GetDevicePeriod(Some(&mut default_period), Some(&mut min_period))
-            .map_err(|e| format!("GetDevicePeriod: {e}"))?;
-    }
-    if min_period <= 0 {
-        min_period = 30_000; // 3 ms fallback
-    }
-
-    let mut client: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| format!("Activate: {e}"))?;
-    let mut dur = min_period;
-    let mut init = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, dur, dur, &format, None);
-
-    if let Err(e) = &init {
-        if e.code() == NOT_ALIGNED {
-            let frames = client.GetBufferSize().map_err(|e| format!("GetBufferSize: {e}"))?;
-            // Aligned duration (hns) for the reported buffer frame count.
-            dur = ((10_000.0 * 1_000.0 / CAPTURE_RATE as f64) * frames as f64 + 0.5) as i64;
-            client = device.Activate(CLSCTX_ALL, None).map_err(|e| format!("Activate: {e}"))?;
-            init = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, dur, dur, &format, None);
-        }
-    }
-    init.map_err(|e| format!("exclusive Initialize: {e}"))?;
-
-    let event = CreateEventW(None, false, false, PCWSTR::null())?;
-    if let Err(e) = client.SetEventHandle(event) {
-        let _ = CloseHandle(event);
-        return Err(e.into());
-    }
-    let capture: IAudioCaptureClient = match client.GetService() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = CloseHandle(event);
-            return Err(e.into());
+        match probe.GetMixFormat() {
+            Ok(p) => {
+                let w = ptr::read_unaligned(p);
+                let out = (w.nSamplesPerSec, w.nChannels.max(1));
+                CoTaskMemFree(Some(p as *const c_void));
+                out
+            }
+            Err(_) => (CAPTURE_RATE, 2),
         }
     };
 
-    Ok(CaptureStream {
-        client,
-        capture,
-        event: Some(event),
-        channels: 2,
-        bytes_per_sample: 2,
-        is_float: false,
-        sample_rate: CAPTURE_RATE,
-        source: AudioSource::Microphone,
-    })
+    // Candidate PCM formats, most-preferred first: native rate/channels, then
+    // common meeting formats. De-duplicated so we probe each format at most once.
+    let mut candidates: Vec<(u32, u16, u16)> = Vec::new();
+    for &rate in &[native_rate, 48_000, 44_100, 16_000] {
+        for &ch in &[native_ch, 2, 1] {
+            for &bits in &[16u16, 24, 32] {
+                let cand = (rate, ch, bits);
+                if !candidates.contains(&cand) {
+                    candidates.push(cand);
+                }
+            }
+        }
+    }
+
+    // Buffer duration = the device minimum period (re-aligned per candidate below).
+    let min_period = {
+        let probe: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| format!("Activate: {e}"))?;
+        let mut default_period = 0i64;
+        let mut min_period = 0i64;
+        probe
+            .GetDevicePeriod(Some(&mut default_period), Some(&mut min_period))
+            .map_err(|e| format!("GetDevicePeriod: {e}"))?;
+        if min_period <= 0 { 30_000 } else { min_period }
+    };
+
+    let mut last_err = String::from("no exclusive-mode format was accepted");
+    for (rate, channels, bits) in candidates {
+        let format = pcm_format(rate, channels, bits);
+        let mut client: IAudioClient = match device.Activate(CLSCTX_ALL, None) {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = format!("Activate: {e}");
+                continue;
+            }
+        };
+        let mut dur = min_period;
+        let mut init = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, dur, dur, &format, None);
+        if let Err(e) = &init {
+            if e.code() == NOT_ALIGNED {
+                if let Ok(frames) = client.GetBufferSize() {
+                    // Aligned duration (hns) for the reported buffer frame count.
+                    dur = ((10_000.0 * 1_000.0 / rate as f64) * frames as f64 + 0.5) as i64;
+                    if let Ok(c) = device.Activate(CLSCTX_ALL, None) {
+                        client = c;
+                        init = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, dur, dur, &format, None);
+                    }
+                }
+            }
+        }
+        if let Err(e) = init {
+            last_err = format!("{rate}Hz/{channels}ch/{bits}bit: {e}");
+            continue;
+        }
+
+        let event = CreateEventW(None, false, false, PCWSTR::null())?;
+        if let Err(e) = client.SetEventHandle(event) {
+            let _ = CloseHandle(event);
+            return Err(e.into());
+        }
+        let capture: IAudioCaptureClient = match client.GetService() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = CloseHandle(event);
+                return Err(e.into());
+            }
+        };
+        tracing::info!("microphone: exclusive-mode format {rate}Hz/{channels}ch/{bits}bit");
+        return Ok(CaptureStream {
+            client,
+            capture,
+            event: Some(event),
+            channels,
+            bytes_per_sample: (bits / 8) as usize,
+            is_float: false,
+            sample_rate: rate,
+            source: AudioSource::Microphone,
+            exclusive: true,
+        });
+    }
+    Err(last_err.into())
 }
 
 // -------------------------------------------------------------------- decoding

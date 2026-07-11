@@ -111,6 +111,9 @@ pub fn run() {
             commands::transcribe_meeting,
             commands::summarize_meeting,
             commands::open_recordings_folder,
+            commands::audio_health,
+            commands::repair_audio,
+            commands::open_sound_settings,
             recorder::start_recording,
             recorder::stop_recording,
         ])

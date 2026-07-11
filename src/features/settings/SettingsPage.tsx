@@ -1,12 +1,18 @@
 import { useEffect, useState } from "react";
 import {
+  AlertTriangle,
+  ExternalLink,
   FolderOpen,
   Monitor,
   Moon,
+  RefreshCw,
   Rocket,
+  ShieldCheck,
   Sparkles,
+  Stethoscope,
   Sun,
   Waves,
+  Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,7 +23,7 @@ import { cn } from "@/lib/utils";
 import { MODE_META, ORDERED_MODES } from "@/lib/meta";
 import { api } from "@/lib/api";
 import { useSettings, useUpdateSettings } from "@/hooks/useMeetings";
-import type { CaptureMode, Settings } from "@/types";
+import type { AudioHealth, CaptureMode, Settings } from "@/types";
 
 export function SettingsPage() {
   const { data: settings } = useSettings();
@@ -82,6 +88,14 @@ export function SettingsPage() {
             checked={settings.cancelOthersNoise}
             onChange={(v) => set({ cancelOthersNoise: v })}
           />
+        </SettingsSection>
+
+        {/* Audio troubleshooting */}
+        <SettingsSection
+          title="Audio troubleshooting"
+          icon={<Stethoscope className="size-4" />}
+        >
+          <AudioHealthCard />
         </SettingsSection>
 
         {/* Startup */}
@@ -184,6 +198,119 @@ export function SettingsPage() {
         <div className="h-8" />
       </div>
     </ScrollArea>
+  );
+}
+
+/**
+ * Detect whether the Windows shared-mode audio engine is impaired (a broken
+ * "audio enhancement"/APO) and offer the one-click repair. On healthy machines
+ * this just shows a green all-clear; on non-Windows it renders nothing.
+ */
+function AudioHealthCard() {
+  const [health, setHealth] = useState<AudioHealth | null>(null);
+  const [checking, setChecking] = useState(true);
+  const [repairing, setRepairing] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  const check = async () => {
+    setChecking(true);
+    try {
+      setHealth(await api.audioHealth());
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  useEffect(() => {
+    void check();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const repair = async () => {
+    setRepairing(true);
+    setNote(null);
+    try {
+      setNote(await api.repairAudio());
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRepairing(false);
+    }
+  };
+
+  // Nothing to repair off-Windows.
+  if (health && !health.supported) return null;
+
+  const healthy = health?.sharedOk ?? true;
+
+  return (
+    <div className="flex flex-col gap-3 p-4">
+      <div className="flex items-start gap-2">
+        {healthy ? (
+          <ShieldCheck className="mt-0.5 size-4 shrink-0 text-emerald-500" />
+        ) : (
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
+        )}
+        <div className="min-w-0">
+          <p className="text-sm font-medium">
+            {checking
+              ? "Checking audio…"
+              : healthy
+                ? "Audio engine healthy"
+                : "Audio engine needs repair"}
+          </p>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {health?.detail ??
+              "Checking whether Windows shared-mode audio is working…"}
+          </p>
+          {health && !health.sharedOk && health.exclusiveOk && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              Recording still works via exclusive mode, but it may take the
+              microphone away from apps like Zoom or Teams. Repairing restores
+              normal shared mode so both work together.
+            </p>
+          )}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="outline" size="sm" onClick={check} disabled={checking}>
+          <RefreshCw className={cn(checking && "animate-spin")} />
+          Re-check
+        </Button>
+        {health && !health.sharedOk && (
+          <Button size="sm" onClick={repair} disabled={repairing}>
+            <Wrench />
+            {repairing ? "Starting repair…" : "Repair audio"}
+          </Button>
+        )}
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => api.openSoundSettings()}
+        >
+          <ExternalLink />
+          Windows sound settings
+        </Button>
+      </div>
+
+      {note && (
+        <p className="rounded-md border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          {note}
+        </p>
+      )}
+
+      {health && !health.sharedOk && (
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          The repair disables the “audio enhancements” on your default microphone
+          and speakers and restarts Windows Audio. It’s reversible, installs
+          nothing, and needs a one-time Windows admin approval. After it finishes,
+          click “Re-check”.
+        </p>
+      )}
+    </div>
   );
 }
 

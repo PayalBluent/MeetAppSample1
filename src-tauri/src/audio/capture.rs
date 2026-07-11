@@ -10,21 +10,29 @@ use std::time::{Duration, Instant};
 
 use super::{AudioPacket, AudioSource};
 
-/// Start microphone capture. On Windows the primary path is the maintained
-/// `wasapi` crate (safe, event-driven, with shared-mode format auto-conversion);
-/// cpal is kept only as a last-resort fallback. On other platforms cpal is used.
-pub fn spawn_microphone(tx: Sender<AudioPacket>, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+/// Start microphone capture. On Windows the primary path is a raw WASAPI capture
+/// endpoint (shared mode, then exclusive mode as a fallback for machines whose
+/// shared audio engine is impaired); cpal is the last-resort fallback. On other
+/// platforms cpal is used. Returns the capture thread plus `exclusive = true` when
+/// the mic had to open in exclusive mode, so callers can warn that other apps
+/// (Zoom/Teams) may lose the microphone while recording.
+pub fn spawn_microphone(
+    tx: Sender<AudioPacket>,
+    stop: Arc<AtomicBool>,
+) -> Option<(JoinHandle<()>, bool)> {
     #[cfg(windows)]
     {
-        if let Some(h) = crate::platform::windows::system_audio::start_microphone(tx.clone(), stop.clone()) {
-            return Some(h);
+        if let Some((h, exclusive)) =
+            crate::platform::windows::system_audio::start_microphone(tx.clone(), stop.clone())
+        {
+            return Some((h, exclusive));
         }
         tracing::warn!("microphone: wasapi capture unavailable, falling back to cpal");
-        cpal_microphone(tx, stop)
+        cpal_microphone(tx, stop).map(|h| (h, false))
     }
     #[cfg(not(windows))]
     {
-        cpal_microphone(tx, stop)
+        cpal_microphone(tx, stop).map(|h| (h, false))
     }
 }
 
