@@ -158,7 +158,8 @@ export function TranscriptView({
               </div>
             ) : (
               <p className="px-2 py-8 text-center text-sm text-muted-foreground">
-                No transcript available.
+                No audio was captured for this meeting, so there's nothing to
+                transcribe.
               </p>
             ))}
         </div>

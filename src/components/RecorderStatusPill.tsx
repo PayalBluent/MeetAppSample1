@@ -19,6 +19,9 @@ export function RecorderStatusPill({ className }: { className?: string }) {
   if (!status) return null;
 
   const recording = status.state === "recording";
+  // Recording but audio hasn't started flowing yet (devices still opening).
+  const starting = recording && !status.audioReady;
+  const live = recording && status.audioReady;
   const active = recording || status.state === "detecting";
   const mode = MODE_META[status.mode];
 
@@ -33,7 +36,8 @@ export function RecorderStatusPill({ className }: { className?: string }) {
         <span
           className={cn(
             "size-2 rounded-full",
-            recording && "bg-destructive animate-rec-pulse",
+            starting && "bg-muted-foreground/60 animate-pulse",
+            live && "bg-destructive animate-rec-pulse",
             status.state === "detecting" && "bg-warning",
             status.state === "processing" && "bg-primary",
             status.state === "armed" && "bg-primary/70",
@@ -43,7 +47,9 @@ export function RecorderStatusPill({ className }: { className?: string }) {
         />
       </span>
 
-      <span className="text-foreground">{STATE_LABEL[status.state]}</span>
+      <span className="text-foreground">
+        {starting ? "Getting audio…" : STATE_LABEL[status.state]}
+      </span>
 
       {active && (
         <>
@@ -52,7 +58,7 @@ export function RecorderStatusPill({ className }: { className?: string }) {
         </>
       )}
 
-      {recording && (
+      {live && (
         <motion.span
           key="elapsed"
           initial={{ opacity: 0 }}

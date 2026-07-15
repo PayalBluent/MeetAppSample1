@@ -7,6 +7,7 @@ import {
   Clock,
   FolderOpen,
   ListChecks,
+  Loader2,
   Lock,
   LockOpen,
   MoreHorizontal,
@@ -86,6 +87,15 @@ export function MeetingDetailPage() {
   const hasMedia = meeting.hasAudio || meeting.hasVideo;
   const audioSrc = toMediaSrc(meeting.audioPath);
   const videoSrc = toMediaSrc(meeting.videoPath);
+  // The recording is auto-corrected (noise cancellation + loudness enhancement)
+  // while the meeting is "processing"; the player only appears once it's "ready".
+  const mediaReady = meeting.status === "ready";
+  // Transcription needs captured audio; summarization needs a transcript. When no
+  // audio was captured there's nothing to transcribe, and with no transcript
+  // there's nothing to summarize — so both actions are disabled in that case.
+  const hasTranscript = meeting.transcript.length > 0;
+  const canTranscribe = meeting.hasAudio;
+  const canSummarize = hasTranscript;
 
   return (
     <div className="flex h-full flex-col">
@@ -196,14 +206,21 @@ export function MeetingDetailPage() {
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onSelect={() => transcribe.mutate(meeting.id)}
-                  disabled={!meeting.hasAudio}
+                  disabled={!canTranscribe}
                 >
                   <ScrollText />
-                  Transcribe (AssemblyAI)
+                  {canTranscribe
+                    ? "Transcribe (AssemblyAI)"
+                    : "Transcribe — no audio"}
                 </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => summarize.mutate(meeting.id)}>
+                <DropdownMenuItem
+                  onSelect={() => summarize.mutate(meeting.id)}
+                  disabled={!canSummarize}
+                >
                   <Sparkles />
-                  Summarize (Groq)
+                  {canSummarize
+                    ? "Summarize (Groq)"
+                    : "Summarize — transcribe first"}
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -262,6 +279,7 @@ export function MeetingDetailPage() {
                   <SummaryView
                     meeting={meeting}
                     regenerating={summarize.isPending}
+                    canSummarize={canSummarize}
                     onRegenerate={() => summarize.mutate(meeting.id)}
                   />
                   <Separator />
@@ -336,7 +354,11 @@ export function MeetingDetailPage() {
         {/* Aside: media + people */}
         <ScrollArea className="min-h-0">
           <div className="space-y-5 p-5">
-            {hasMedia ? (
+            {!hasMedia ? (
+              <div className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
+                Transcript-only session — no audio was saved.
+              </div>
+            ) : mediaReady ? (
               <MediaPlayer
                 meeting={meeting}
                 playback={playback}
@@ -346,8 +368,20 @@ export function MeetingDetailPage() {
                 onOpenFile={() => api.openRecordingsFolder()}
               />
             ) : (
-              <div className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
-                Transcript-only session — no audio was saved.
+              // Audio is auto-corrected (noise cancellation + loudness enhancement)
+              // before it can be played. Until then it's unavailable — no player.
+              <div className="flex items-start gap-3 rounded-xl border border-border bg-secondary/30 p-4 text-sm">
+                <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin text-primary" />
+                <div>
+                  <p className="font-medium text-foreground">
+                    Audio unavailable
+                  </p>
+                  <p className="mt-1 text-muted-foreground">
+                    {live
+                      ? "Recording in progress — the audio becomes available once it's processed."
+                      : "Enhancing and noise-cleaning the audio… it'll be playable as soon as it's ready."}
+                  </p>
+                </div>
               </div>
             )}
 

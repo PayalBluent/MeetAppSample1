@@ -151,6 +151,17 @@ export interface RecorderStatus {
   /** Live input levels 0..1 for the meters. */
   micLevel: number;
   systemLevel: number;
+  /**
+   * Capture volume multiplier applied to recorded audio. `1.0` is unity; the
+   * default is a mild boost. Adjustable live via the volume control.
+   */
+  inputGain: number;
+  /**
+   * `true` once capture is actually live (first audio packet processed). Stays
+   * `false` during the brief device-setup window right after recording starts,
+   * so the UI can show a "starting…" state until audio flows.
+   */
+  audioReady: boolean;
   message?: string | null;
 }
 

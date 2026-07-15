@@ -12,6 +12,10 @@ import type {
 import { EventBus } from "./eventBus";
 import { createSeedMeetings, nextId } from "./seed";
 
+/** Mirrors the backend message shown when an audio action has no audio to act on. */
+const AUDIO_UNAVAILABLE =
+  "Audio isn't available for this meeting, so it can't be enhanced or cleaned yet.";
+
 /**
  * In-memory stand-in for the Rust backend. It implements the exact same command
  * surface and event stream, so the React app is fully functional in a plain
@@ -43,6 +47,8 @@ class MockBackend {
     elapsedSec: 0,
     micLevel: 0,
     systemLevel: 0,
+    inputGain: 1.5,
+    audioReady: false,
     message: null,
   };
 
@@ -120,6 +126,13 @@ class MockBackend {
     },
 
     stop_capture: (): Meeting | null => this.finalizeLiveMeeting(),
+
+    set_input_gain: ({ gain }: { gain: number }): RecorderStatus => {
+      const clamped = Number.isFinite(gain) ? Math.min(3, Math.max(0, gain)) : 1;
+      this.status.inputGain = clamped;
+      this.emitStatus();
+      return { ...this.status };
+    },
 
     capture_detected: ({ id }: { id: string }): RecorderStatus => {
       const det = this.detected.get(id);
@@ -220,6 +233,22 @@ class MockBackend {
       m.actionItems = this.extractActionItems(m.transcript);
       m.status = "ready";
       this.bus.emit("meeting://updated", { ...m });
+      return { ...m };
+    },
+
+    enhance_meeting_audio: ({ id }: { id: string }): Meeting => {
+      const m = this.requireMeeting(id);
+      if (!m.hasAudio) throw new Error(AUDIO_UNAVAILABLE);
+      // Real backend loudness-normalizes the WAV in place; the mock just echoes.
+      console.info("[mock] enhance_meeting_audio", id);
+      return { ...m };
+    },
+
+    clean_meeting_audio: ({ id }: { id: string }): Meeting => {
+      const m = this.requireMeeting(id);
+      if (!m.hasAudio) throw new Error(AUDIO_UNAVAILABLE);
+      // Real backend runs RNNoise over the WAV in place; the mock just echoes.
+      console.info("[mock] clean_meeting_audio", id);
       return { ...m };
     },
 
@@ -325,16 +354,34 @@ class MockBackend {
     this.status.mode = opts.mode; // reflect the effective capture mode in the UI
     this.status.activeMeetingId = meeting.id;
     this.status.elapsedSec = 0;
+    // Capture isn't live instantly: real devices need a moment to open (WASAPI
+    // activation, mic validation). Mirror that so the "starting…" UI is exercised
+    // in dev, then flip to live after a short delay.
+    this.status.audioReady = false;
+    this.status.micLevel = 0;
+    this.status.systemLevel = 0;
     this.emitStatus();
     this.bus.emit("meeting://updated", { ...meeting });
 
-    // 1s heartbeat: elapsed + animated input levels.
+    setTimeout(() => {
+      if (this.status.activeMeetingId !== meeting.id) return; // stopped meanwhile
+      this.status.audioReady = true;
+      this.emitStatus();
+    }, 1_200);
+
+    // 1s heartbeat: elapsed + animated input levels (levels stay at 0 until live).
     this.tickTimer = setInterval(() => {
       this.status.elapsedSec += 1;
       meeting.durationSec = this.status.elapsedSec;
-      this.status.micLevel = 0.25 + Math.random() * 0.6;
-      this.status.systemLevel =
-        opts.mode === "transcribe" ? 0.15 + Math.random() * 0.3 : 0.3 + Math.random() * 0.55;
+      if (!this.status.audioReady) return;
+      // Scale the simulated levels by the capture volume so the meters visibly
+      // respond to the volume control (mirrors the real gain-boosted meter).
+      const g = this.status.inputGain;
+      const base = 0.25 + Math.random() * 0.4;
+      const sysBase =
+        opts.mode === "transcribe" ? 0.15 + Math.random() * 0.2 : 0.3 + Math.random() * 0.35;
+      this.status.micLevel = Math.min(1, base * g);
+      this.status.systemLevel = Math.min(1, sysBase * g);
       this.emitStatus();
     }, 1_000);
 
@@ -355,6 +402,7 @@ class MockBackend {
     this.setState("processing");
     this.status.micLevel = 0;
     this.status.systemLevel = 0;
+    this.status.audioReady = false;
     this.emitStatus();
 
     meeting.endedAt = new Date().toISOString();

@@ -7,11 +7,15 @@ import {
   ChevronRight,
   CloudUpload,
   FolderOpen,
+  Loader2,
   LogOut,
   Mic,
+  Minus,
+  Plus,
   Settings as SettingsIcon,
   Square,
   User,
+  Volume2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -38,6 +42,7 @@ import {
   useSetMode,
   useStartCapture,
   useStopCapture,
+  useSetInputGain,
   useCaptureDetected,
   useDismissDetected,
 } from "@/hooks/useMeetings";
@@ -55,12 +60,17 @@ export function PanelPage() {
   const updateSettings = useUpdateSettings();
   const startCapture = useStartCapture();
   const stopCapture = useStopCapture();
+  const setInputGain = useSetInputGain();
   const captureDetected = useCaptureDetected();
   const dismissDetected = useDismissDetected();
 
   const mode = status?.mode ?? "off";
   const recording = status?.state === "recording";
   const processing = status?.state === "processing";
+  // Capture goes live a moment after "start" — devices need time to open. Until
+  // the first audio arrives we show a "starting…" state instead of live meters.
+  const audioReady = status?.audioReady ?? false;
+  const inputGain = status?.inputGain ?? 1.5;
 
   const openMeetings = async () => {
     const shown = await showMainWindow();
@@ -150,28 +160,56 @@ export function PanelPage() {
                     exit={{ opacity: 0, height: 0 }}
                     className="overflow-hidden"
                   >
-                    <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-3">
+                    <div
+                      className={cn(
+                        "rounded-xl border p-3 transition-colors",
+                        audioReady
+                          ? "border-destructive/30 bg-destructive/5"
+                          : "border-border bg-secondary/40",
+                      )}
+                    >
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
-                          <span className="size-2.5 rounded-full bg-destructive animate-rec-pulse" />
+                          {audioReady ? (
+                            <span className="size-2.5 rounded-full bg-destructive animate-rec-pulse" />
+                          ) : (
+                            <Loader2 className="size-4 animate-spin text-muted-foreground" />
+                          )}
                           <span className="text-sm font-semibold text-foreground">
-                            {MODE_META[status.mode].label}
+                            {audioReady
+                              ? MODE_META[status.mode].label
+                              : "Getting audio…"}
                           </span>
                         </div>
-                        <span className="font-mono text-sm tabular-nums text-foreground">
-                          {formatTimestamp(status.elapsedSec * 1000)}
-                        </span>
-                      </div>
-                      <div className="mt-3 space-y-2">
-                        <MeterRow
-                          label="Mic"
-                          level={status.micLevel}
-                          tone="destructive"
-                        />
-                        {status.mode !== "transcribe" && (
-                          <MeterRow label="System" level={status.systemLevel} />
+                        {audioReady && (
+                          <div className="flex items-center gap-2">
+                            <VolumeStepper
+                              gain={inputGain}
+                              onChange={(g) => setInputGain.mutate(g)}
+                            />
+                            <span className="font-mono text-sm tabular-nums text-foreground">
+                              {formatTimestamp(status.elapsedSec * 1000)}
+                            </span>
+                          </div>
                         )}
                       </div>
+                      {audioReady ? (
+                        <div className="mt-3 space-y-2">
+                          <MeterRow
+                            label="Mic"
+                            level={status.micLevel}
+                            tone="destructive"
+                          />
+                          {status.mode !== "transcribe" && (
+                            <MeterRow label="System" level={status.systemLevel} />
+                          )}
+                        </div>
+                      ) : (
+                        <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                          Getting the audio from your microphone and system —
+                          recording begins the moment audio comes through.
+                        </p>
+                      )}
                     </div>
                   </motion.div>
                 )}
@@ -206,8 +244,17 @@ export function PanelPage() {
                       }
                       disabled={startCapture.isPending || processing}
                     >
-                      <Mic className="text-destructive" />
-                      Record Live
+                      {startCapture.isPending ? (
+                        <>
+                          <Loader2 className="animate-spin" />
+                          Getting audio…
+                        </>
+                      ) : (
+                        <>
+                          <Mic className="text-destructive" />
+                          Record Live
+                        </>
+                      )}
                     </Button>
                     <Button
                       variant="outline"
@@ -218,6 +265,38 @@ export function PanelPage() {
                     </Button>
                   </>
                 )}
+              </div>
+            </section>
+
+            <Separator />
+
+            {/* Capture volume (input gain) — always visible so it can be set
+                before recording, and adjustable live during a recording. */}
+            <section className="space-y-3">
+              <h2 className="text-lg font-semibold tracking-tight text-primary">
+                Capture Volume
+              </h2>
+              <div className="flex items-center justify-between rounded-lg border border-border bg-card px-3 py-2.5">
+                <div className="flex items-center gap-2.5">
+                  <Volume2 className="size-[18px] text-foreground" />
+                  <div className="flex flex-col">
+                    <span className="text-sm font-semibold text-foreground">
+                      {Math.round(inputGain * 100)}%
+                      {inputGain > 1 && (
+                        <span className="ml-1.5 text-xs font-medium text-primary">
+                          boosted
+                        </span>
+                      )}
+                    </span>
+                    <span className="text-[11px] text-muted-foreground">
+                      Louder recordings — raise for quiet mics
+                    </span>
+                  </div>
+                </div>
+                <VolumeStepper
+                  gain={inputGain}
+                  onChange={(g) => setInputGain.mutate(g)}
+                />
               </div>
             </section>
 
@@ -244,6 +323,54 @@ export function PanelPage() {
           </div>
         </ScrollArea>
       </div>
+    </div>
+  );
+}
+
+/** Volume stepper: visible − / + buttons around a live percentage readout.
+ *  Adjusts the capture gain the backend applies to recorded audio, live, via
+ *  `set_input_gain`. Steps by 25%, clamped to 0–300%. */
+const VOLUME_STEP = 0.25;
+const VOLUME_MAX = 3;
+
+function VolumeStepper({
+  gain,
+  onChange,
+}: {
+  gain: number;
+  onChange: (gain: number) => void;
+}) {
+  const pct = Math.round(gain * 100);
+  // Snap to the step grid and clamp, so repeated clicks land on clean values.
+  const set = (g: number) =>
+    onChange(Math.min(VOLUME_MAX, Math.max(0, Math.round(g * 100) / 100)));
+  const btn =
+    "no-drag grid size-7 place-items-center rounded-md border border-border text-foreground transition-colors hover:bg-secondary disabled:pointer-events-none disabled:opacity-40";
+  return (
+    <div className="flex items-center gap-1">
+      <button
+        type="button"
+        onClick={() => set(gain - VOLUME_STEP)}
+        disabled={gain <= 0}
+        aria-label="Decrease capture volume"
+        title="Decrease volume"
+        className={btn}
+      >
+        <Minus className="size-3.5" />
+      </button>
+      <span className="min-w-[3.5ch] text-center font-mono text-xs font-medium tabular-nums text-foreground">
+        {pct}%
+      </span>
+      <button
+        type="button"
+        onClick={() => set(gain + VOLUME_STEP)}
+        disabled={gain >= VOLUME_MAX}
+        aria-label="Increase capture volume"
+        title="Increase volume"
+        className={btn}
+      >
+        <Plus className="size-3.5" />
+      </button>
     </div>
   );
 }

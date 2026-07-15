@@ -14,10 +14,13 @@ export function SummaryView({
   meeting,
   onRegenerate,
   regenerating,
+  canSummarize = true,
 }: {
   meeting: Meeting;
   onRegenerate: () => void;
   regenerating: boolean;
+  /** False when there's no transcript to summarize (e.g. no audio captured). */
+  canSummarize?: boolean;
 }) {
   const summary = meeting.summary;
   const pending = meeting.status === "live" || meeting.status === "processing";
@@ -39,9 +42,16 @@ export function SummaryView({
           <div className="flex flex-col items-center gap-3 py-4 text-center">
             <Sparkles className="size-6 text-primary" />
             <p className="text-sm text-muted-foreground">
-              No summary yet for this meeting.
+              {canSummarize
+                ? "No summary yet for this meeting."
+                : "Transcribe the recording first — there's no transcript to summarize yet."}
             </p>
-            <Button variant="brand" size="sm" onClick={onRegenerate}>
+            <Button
+              variant="brand"
+              size="sm"
+              onClick={onRegenerate}
+              disabled={!canSummarize}
+            >
               <Sparkles /> Generate summary
             </Button>
           </div>
@@ -67,7 +77,7 @@ export function SummaryView({
             variant="ghost"
             size="sm"
             onClick={onRegenerate}
-            disabled={regenerating}
+            disabled={regenerating || !canSummarize}
             className="h-7 text-xs text-muted-foreground"
           >
             <RefreshCw className={cn("size-3.5", regenerating && "animate-spin")} />

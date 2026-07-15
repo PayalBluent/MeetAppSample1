@@ -12,14 +12,16 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use super::denoise::SpeechDetector;
 use super::vad::Vad;
 use super::{AudioPacket, AudioSource, SpeakerSegment};
+use crate::models::MAX_INPUT_GAIN;
 
 /// Output sample rate for the stored WAV.
 const OUT_RATE: u32 = 48_000;
@@ -37,6 +39,8 @@ pub fn spawn(
     mic_level: Arc<AtomicU32>,
     sys_level: Arc<AtomicU32>,
     segments: Arc<Mutex<Vec<SpeakerSegment>>>,
+    audio_ready: Arc<AtomicBool>,
+    gain: Arc<AtomicU32>,
 ) -> Option<JoinHandle<()>> {
     let spec = hound::WavSpec {
         channels: 2,
@@ -55,7 +59,9 @@ pub fn spawn(
 
     std::thread::Builder::new()
         .name("meetapp-audio-pipeline".into())
-        .spawn(move || run(rx, writer, path, start, mic_level, sys_level, segments))
+        .spawn(move || {
+            run(rx, writer, path, start, mic_level, sys_level, segments, audio_ready, gain)
+        })
         .ok()
 }
 
@@ -67,9 +73,11 @@ fn run(
     mic_level: Arc<AtomicU32>,
     sys_level: Arc<AtomicU32>,
     segments: Arc<Mutex<Vec<SpeakerSegment>>>,
+    audio_ready: Arc<AtomicBool>,
+    gain: Arc<AtomicU32>,
 ) {
-    let mut mic = Channel::new("You", mic_level);
-    let mut sys = Channel::new("Remote", sys_level);
+    let mut mic = Channel::new("You", mic_level, gain.clone());
+    let mut sys = Channel::new("Remote", sys_level, gain);
     let mut segs: Vec<SpeakerSegment> = Vec::new();
     let mut last_ms = 0u64;
 
@@ -77,6 +85,9 @@ fn run(
         match rx.recv_timeout(FLUSH) {
             Ok(pkt) => {
                 last_ms = process(&pkt, start, &mut mic, &mut sys, &mut segs);
+                // First real audio in hand — signal that capture is live so the UI
+                // can drop its "starting…" state and let the user start/transcribe.
+                audio_ready.store(true, Ordering::Relaxed);
                 // Drain any burst without blocking so we never fall behind.
                 while let Ok(pkt) = rx.try_recv() {
                     last_ms = process(&pkt, start, &mut mic, &mut sys, &mut segs);
@@ -189,7 +200,11 @@ fn to_i16(sample: f32) -> i16 {
 /// Per-source processing state.
 struct Channel {
     level: Arc<AtomicU32>,
+    /// Capture volume, read live so the volume control takes effect mid-recording.
+    gain: Arc<AtomicU32>,
     vad: Vad,
+    /// Trained speech detector (RNNoise VAD probability) driving `vad`.
+    detector: SpeechDetector,
     seg: SegmentTracker,
     resampler: Option<Resampler>,
     /// Resampled 48 kHz mono awaiting interleave into the WAV.
@@ -203,10 +218,12 @@ struct Channel {
 }
 
 impl Channel {
-    fn new(speaker: &'static str, level: Arc<AtomicU32>) -> Self {
+    fn new(speaker: &'static str, level: Arc<AtomicU32>, gain: Arc<AtomicU32>) -> Self {
         Channel {
             level,
+            gain,
             vad: Vad::new(),
+            detector: SpeechDetector::new(),
             seg: SegmentTracker::new(speaker),
             resampler: None,
             q: VecDeque::new(),
@@ -217,16 +234,20 @@ impl Channel {
     }
 
     fn push(&mut self, pkt: &AudioPacket, now_ms: u64, segs: &mut Vec<SpeakerSegment>) {
+        // Capture volume, read fresh each buffer so the volume control is live.
+        let gain = f32::from_bits(self.gain.load(Ordering::Relaxed)).clamp(0.0, MAX_INPUT_GAIN);
+
         let mono = downmix(&pkt.samples, pkt.channels);
+        // `level` is the raw (pre-gain) loudness — used for the speech-detection
+        // energy floor and the "was anything captured?" verdict, so neither is
+        // skewed by the volume setting. The meter shows the *boosted* level so the
+        // user sees the effect of the control.
         let level = rms(&mono);
-        self.level.store((level * 3.0).min(1.0).to_bits(), Ordering::Relaxed);
+        self.level.store((level * gain * 3.0).min(1.0).to_bits(), Ordering::Relaxed);
         self.packets += 1;
         if level > self.peak {
             self.peak = level;
         }
-
-        let speaking = self.vad.update(level);
-        self.seg.update(speaking, now_ms, segs);
 
         // Align sources to a shared t = 0 (the recorder's start instant). A stream
         // that opens late (e.g. system loopback activation lags the mic) gets its
@@ -239,10 +260,28 @@ impl Channel {
             self.q.extend(std::iter::repeat(0.0).take(lead.min(MIXER_CAP)));
         }
 
+        // Resample to 48 kHz first: RNNoise's speech detector requires that rate,
+        // and it's the WAV's rate anyway. Then detect *speech* on the resampled
+        // mono and gate segmentation on the trained probability (not loudness),
+        // so music/typing/hum never open a speaker segment.
         let rs = self
             .resampler
             .get_or_insert_with(|| Resampler::new(pkt.sample_rate, OUT_RATE));
-        rs.process(&mono, &mut self.q);
+        let mut resampled: Vec<f32> = Vec::new();
+        rs.process(&mono, &mut resampled);
+
+        let speech_prob = self.detector.update(&resampled);
+        let speaking = self.vad.update(speech_prob, level);
+        self.seg.update(speaking, now_ms, segs);
+
+        // Apply the capture volume to the audio we actually store. `to_i16` clamps
+        // on write, so pushing gain past unity boosts quiet audio and hard-limits
+        // anything that would overflow rather than wrapping.
+        if (gain - 1.0).abs() < f32::EPSILON {
+            self.q.extend(resampled);
+        } else {
+            self.q.extend(resampled.iter().map(|s| s * gain));
+        }
     }
 }
 
@@ -330,7 +369,7 @@ impl Resampler {
         }
     }
 
-    fn process(&mut self, input: &[f32], out: &mut VecDeque<f32>) {
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
         if self.passthrough {
             out.extend(input.iter().copied());
             return;
@@ -343,7 +382,7 @@ impl Resampler {
             let frac = (pos - i0 as f64) as f32;
             let a = self.buf[i0];
             let b = self.buf[i0 + 1];
-            out.push_back(a + (b - a) * frac);
+            out.push(a + (b - a) * frac);
             pos += self.step;
         }
         let base = (pos.floor() as usize).min(self.buf.len());
@@ -367,7 +406,7 @@ mod tests {
     #[test]
     fn resampler_upsamples_count() {
         let mut rs = Resampler::new(44_100, 48_000);
-        let mut out = VecDeque::new();
+        let mut out: Vec<f32> = Vec::new();
         rs.process(&vec![0.1; 44_100], &mut out);
         assert!(out.len() > 47_000 && out.len() <= 48_000, "got {}", out.len());
     }
@@ -375,7 +414,7 @@ mod tests {
     #[test]
     fn resampler_passthrough() {
         let mut rs = Resampler::new(48_000, 48_000);
-        let mut out = VecDeque::new();
+        let mut out: Vec<f32> = Vec::new();
         rs.process(&[0.1, 0.2, 0.3], &mut out);
         assert_eq!(out.len(), 3);
     }
@@ -400,6 +439,8 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicU32::new(0)),
             Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
         )
         .expect("pipeline should start");
 

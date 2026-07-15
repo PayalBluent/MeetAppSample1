@@ -101,6 +101,28 @@ pub fn start_capture(
     Ok(state.status.read().clone())
 }
 
+/// Set the capture volume (input gain). Takes effect immediately — the audio
+/// pipeline reads this every buffer — so the volume control works mid-recording.
+/// Clamped to `[0, MAX_INPUT_GAIN]`. Returns the updated status.
+#[tauri::command]
+pub fn set_input_gain(app: AppHandle, state: State<'_, AppState>, gain: f32) -> RecorderStatus {
+    let clamped = if gain.is_finite() {
+        gain.clamp(0.0, crate::models::MAX_INPUT_GAIN)
+    } else {
+        1.0
+    };
+    state
+        .recording_gain
+        .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    let snapshot = {
+        let mut st = state.status.write();
+        st.input_gain = clamped;
+        st.clone()
+    };
+    Events::status(&app, &snapshot);
+    snapshot
+}
+
 #[tauri::command]
 pub fn stop_capture(app: AppHandle, state: State<'_, AppState>) -> AppResult<Option<Meeting>> {
     match recorder::stop(&app, state.inner()) {
@@ -256,6 +278,76 @@ pub async fn summarize_meeting(
     })
     .await
     .map_err(|e| AppError::Other(format!("summarization task failed: {e}")))?
+}
+
+/// Error surfaced (in UI and backend) when an audio action is requested for a
+/// meeting whose audio isn't available — no file was saved, or it's gone from
+/// disk. Phrased so the UI can show it verbatim.
+const AUDIO_UNAVAILABLE: &str =
+    "Audio isn't available for this meeting, so it can't be enhanced or cleaned yet.";
+
+/// Resolve a meeting's audio file, returning an error if the audio isn't actually
+/// available (no path recorded, or the file is missing). This is the single gate
+/// both audio-processing commands use so they never run without real audio.
+fn require_available_audio(
+    state: &AppState,
+    id: &str,
+) -> AppResult<(String, Meeting)> {
+    let (audio_path, meeting) = {
+        let meetings = state.meetings.read();
+        let m = meetings
+            .get(id)
+            .ok_or_else(|| AppError::MeetingNotFound(id.to_string()))?;
+        (m.audio_path.clone(), m.clone())
+    };
+    let path = audio_path
+        .filter(|p| std::path::Path::new(p).exists())
+        .ok_or_else(|| AppError::Other(AUDIO_UNAVAILABLE.into()))?;
+    Ok((path, meeting))
+}
+
+/// Enhance a saved recording's audio on demand: loudness-normalizes the WAV in
+/// place so a quiet recording becomes clearly audible, without clipping/distorting
+/// speech (see [`crate::audio::normalize_wav_file`]). Runs off the async runtime
+/// since it rewrites the whole file. Only boosts — never makes audio quieter.
+/// Refuses (with [`AUDIO_UNAVAILABLE`]) when the meeting has no available audio.
+#[tauri::command]
+pub async fn enhance_meeting_audio(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<Meeting> {
+    let (path, meeting) = require_available_audio(state.inner(), &id)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::audio::normalize_wav_file(std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("enhance task failed: {e}")))??;
+
+    Events::updated(&app, &meeting);
+    Ok(meeting)
+}
+
+/// Noise-cancel a saved recording on demand: runs AI noise suppression (RNNoise)
+/// over the WAV in place (see [`crate::audio::clean_wav_file`]). Runs off the
+/// async runtime. Refuses (with [`AUDIO_UNAVAILABLE`]) when audio isn't available.
+#[tauri::command]
+pub async fn clean_meeting_audio(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<Meeting> {
+    let (path, meeting) = require_available_audio(state.inner(), &id)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::audio::clean_wav_file(std::path::Path::new(&path), true)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("noise-cancellation task failed: {e}")))??;
+
+    Events::updated(&app, &meeting);
+    Ok(meeting)
 }
 
 // ------------------------------------------------------------- audio health

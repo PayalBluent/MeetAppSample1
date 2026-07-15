@@ -5,12 +5,19 @@ export interface Playback {
   playing: boolean;
   rate: number;
   durationMs: number;
+  /** Playback volume, 0..1. Loudness itself comes from the backend audio
+   *  enhancement of the file — playback is a plain element volume so it never
+   *  silences cross-origin (Tauri asset) audio the way a Web Audio graph can. */
+  volume: number;
+  muted: boolean;
   toggle: () => void;
   play: () => void;
   pause: () => void;
   seek: (ms: number) => void;
   skip: (deltaMs: number) => void;
   cycleRate: () => void;
+  setVolume: (v: number) => void;
+  toggleMute: () => void;
 }
 
 const RATES = [1, 1.25, 1.5, 2, 0.75];
@@ -27,6 +34,8 @@ export function usePlayback(
   const [currentMs, setCurrentMs] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [rate, setRate] = useState(1);
+  const [volume, setVolumeState] = useState(1);
+  const [muted, setMuted] = useState(false);
   const raf = useRef<number | null>(null);
   const last = useRef<number>(0);
 
@@ -73,6 +82,14 @@ export function usePlayback(
     mediaEl.playbackRate = rate;
   }, [mediaEl, rate]);
 
+  // Reflect volume/mute directly onto the element (no Web Audio graph — that can
+  // silence cross-origin Tauri asset audio).
+  useEffect(() => {
+    if (!mediaEl) return;
+    mediaEl.volume = muted ? 0 : volume;
+    mediaEl.muted = muted;
+  }, [mediaEl, volume, muted]);
+
   useEffect(() => {
     if (!mediaEl) return;
     if (playing) void mediaEl.play().catch(() => setPlaying(false));
@@ -90,6 +107,8 @@ export function usePlayback(
     playing,
     rate,
     durationMs,
+    volume,
+    muted,
     toggle: () => setPlaying((p) => !p),
     play: () => setPlaying(true),
     pause: () => setPlaying(false),
@@ -99,5 +118,12 @@ export function usePlayback(
       const idx = RATES.indexOf(rate);
       setRate(RATES[(idx + 1) % RATES.length]!);
     },
+    setVolume: (v: number) => {
+      const clamped = Math.max(0, Math.min(1, v));
+      setVolumeState(clamped);
+      // Any deliberate volume change unmutes (unless dragged to zero).
+      setMuted(clamped === 0);
+    },
+    toggleMute: () => setMuted((m) => !m),
   };
 }

@@ -40,6 +40,7 @@ sysinfo = "0.33"
 # WAV encoding (used by every capture backend).
 hound = "3"
 
+
 # Microphone + speaker (loopback) capture. 0.16 exposes WASAPI/CoreAudio loopback
 # by building an input stream on the default output device.
 cpal = "0.16"

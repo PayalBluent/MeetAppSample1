@@ -34,6 +34,10 @@ export const api = {
 
   stopCapture: () => invoke<Meeting | null>("stop_capture"),
 
+  /** Set the capture volume (input gain). Takes effect live during recording. */
+  setInputGain: (gain: number) =>
+    invoke<RecorderStatus>("set_input_gain", { gain }),
+
   captureDetected: (id: string) =>
     invoke<RecorderStatus>("capture_detected", { id }),
   dismissDetected: (id: string) => invoke<void>("dismiss_detected", { id }),
@@ -58,6 +62,14 @@ export const api = {
   /** On-demand summarization via Groq (heuristic fallback). */
   summarizeMeeting: (id: string) =>
     invoke<Meeting>("summarize_meeting", { id }),
+
+  /** Loudness-normalize a saved recording so it's clearly audible (no clipping). */
+  enhanceMeetingAudio: (id: string) =>
+    invoke<Meeting>("enhance_meeting_audio", { id }),
+
+  /** AI noise-cancel a saved recording (RNNoise) in place. */
+  cleanMeetingAudio: (id: string) =>
+    invoke<Meeting>("clean_meeting_audio", { id }),
 
   openRecordingsFolder: () => invoke<void>("open_recordings_folder"),
 

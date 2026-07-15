@@ -36,10 +36,105 @@ impl Denoiser for PassThrough {
 #[cfg(feature = "denoise")]
 pub use rnnoise::RnnoiseDenoiser;
 
+/// A speech-activity detector built on RNNoise's trained voice-activity output.
+///
+/// RNNoise doesn't just suppress noise — every processed frame yields a
+/// probability that the frame contains *speech*. Feeding it here (and reading
+/// that probability, which the denoiser path discards) gives us a real
+/// speech/non-speech discriminator for free: music, typing, and fan noise score
+/// low, human voice scores high. This is what lets VAD detect speech instead of
+/// mere loudness. Operates on 48 kHz mono, framed and scaled internally.
+///
+/// Without the `denoise` feature it degrades to a no-op returning `1.0`, so the
+/// caller falls back to a pure energy gate.
+pub struct SpeechDetector {
+    #[cfg(feature = "denoise")]
+    inner: rnnoise::VadState,
+}
+
+impl SpeechDetector {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(feature = "denoise")]
+            inner: rnnoise::VadState::new(),
+        }
+    }
+
+    /// Feed 48 kHz mono samples in `[-1, 1]`; returns the peak speech
+    /// probability `[0, 1]` across the 10 ms frames this call completed, holding
+    /// the previous value when the input is shorter than one frame.
+    pub fn update(&mut self, samples48k: &[f32]) -> f32 {
+        #[cfg(feature = "denoise")]
+        {
+            self.inner.update(samples48k)
+        }
+        #[cfg(not(feature = "denoise"))]
+        {
+            let _ = samples48k;
+            1.0
+        }
+    }
+}
+
+impl Default for SpeechDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(feature = "denoise")]
 mod rnnoise {
     use super::{Denoiser, FRAME_SIZE};
     use nnnoiseless::DenoiseState;
+
+    /// Streaming wrapper that turns 48 kHz mono into RNNoise's per-frame speech
+    /// probability. It runs the same net as [`RnnoiseDenoiser`] but keeps only
+    /// the VAD probability and throws away the cleaned audio (that's the
+    /// storage pipeline's job elsewhere).
+    pub struct VadState {
+        state: Box<DenoiseState<'static>>,
+        /// Pending input, already scaled to the i16 range RNNoise expects.
+        pending: Vec<f32>,
+        /// Last reported probability, held when a call completes no full frame.
+        last_prob: f32,
+        /// The first frame's probability is a fade-in artifact — skip it.
+        warmed: bool,
+    }
+
+    impl VadState {
+        pub fn new() -> Self {
+            Self {
+                state: DenoiseState::new(),
+                pending: Vec::with_capacity(FRAME_SIZE * 4),
+                last_prob: 0.0,
+                warmed: false,
+            }
+        }
+
+        pub fn update(&mut self, samples48k: &[f32]) -> f32 {
+            self.pending.extend(samples48k.iter().map(|s| s * 32768.0));
+
+            let mut scratch = [0.0f32; FRAME_SIZE];
+            let mut frame = [0.0f32; FRAME_SIZE];
+            let mut peak = 0.0f32;
+            let mut produced = false;
+            while self.pending.len() >= FRAME_SIZE {
+                frame.copy_from_slice(&self.pending[..FRAME_SIZE]);
+                self.pending.drain(0..FRAME_SIZE);
+                let prob = self.state.process_frame(&mut scratch, &frame);
+                if !self.warmed {
+                    self.warmed = true; // discard fade-in frame's probability
+                    continue;
+                }
+                peak = peak.max(prob);
+                produced = true;
+            }
+            if produced {
+                self.last_prob = peak;
+            }
+            self.last_prob
+        }
+    }
 
     /// RNNoise-backed suppressor. Buffers input into 480-sample frames and
     /// discards the very first output frame (RNNoise fade-in artifact).

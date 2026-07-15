@@ -5,7 +5,7 @@ import {
 } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { qk } from "@/lib/query";
-import type { CaptureMode, Meeting, Settings } from "@/types";
+import type { CaptureMode, Meeting, RecorderStatus, Settings } from "@/types";
 
 export function useMeetings() {
   return useQuery({ queryKey: qk.meetings, queryFn: api.listMeetings });
@@ -82,6 +82,24 @@ export function useStopCapture() {
       qc.invalidateQueries({ queryKey: qk.recorderStatus });
       qc.invalidateQueries({ queryKey: qk.meetings });
     },
+  });
+}
+
+export function useSetInputGain() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (gain: number) => api.setInputGain(gain),
+    // Optimistic: reflect the new gain in the meter/label immediately so the
+    // volume control feels instant, then reconcile with the server's clamp.
+    onMutate: (gain) => {
+      const prev = qc.getQueryData<RecorderStatus>(qk.recorderStatus);
+      if (prev) qc.setQueryData(qk.recorderStatus, { ...prev, inputGain: gain });
+      return { prev };
+    },
+    onError: (_e, _gain, ctx) => {
+      if (ctx?.prev) qc.setQueryData(qk.recorderStatus, ctx.prev);
+    },
+    onSuccess: (status) => qc.setQueryData(qk.recorderStatus, status),
   });
 }
 
@@ -172,6 +190,24 @@ export function useSummarizeMeeting() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => api.summarizeMeeting(id),
+    onSuccess: (meeting: Meeting) =>
+      qc.setQueryData(qk.meeting(meeting.id), meeting),
+  });
+}
+
+export function useEnhanceAudio() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.enhanceMeetingAudio(id),
+    onSuccess: (meeting: Meeting) =>
+      qc.setQueryData(qk.meeting(meeting.id), meeting),
+  });
+}
+
+export function useCleanAudio() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.cleanMeetingAudio(id),
     onSuccess: (meeting: Meeting) =>
       qc.setQueryData(qk.meeting(meeting.id), meeting),
   });

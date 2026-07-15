@@ -71,7 +71,7 @@ pub fn start(
             // other (two meetings can share a title / the same "Live recording").
             audio::wav_path(&dir, &format!("{slug}-{}", meeting.id))
         };
-        match Recorder::start(&path, capture_system_audio) {
+        match Recorder::start(&path, capture_system_audio, state.recording_gain.clone()) {
             Some(h) => {
                 meeting.audio_path = Some(path.to_string_lossy().replace('\\', "/"));
                 Some(h)
@@ -120,6 +120,10 @@ pub fn start(
         st.mode = mode;
         st.active_meeting_id = Some(meeting_id.clone());
         st.elapsed_sec = 0;
+        st.input_gain = f32::from_bits(state.recording_gain.load(Ordering::Relaxed));
+        // Not live yet — the capture loop flips this on once audio actually flows.
+        // If no device opened at all, there's nothing to wait for, so report ready.
+        st.audio_ready = audio_unavailable;
         st.message = if audio_unavailable {
             Some(
                 "Couldn't open any audio input — check your microphone and Windows \
@@ -177,27 +181,45 @@ fn spawn_capture_loop(
     std::thread::Builder::new()
         .name("meetapp-capture".into())
         .spawn(move || {
+            // Tick faster than once a second so the "starting… → live" transition
+            // and the level meters feel responsive; elapsed seconds are derived
+            // from the tick count (4 ticks = 1 s).
+            const TICK: Duration = Duration::from_millis(250);
+            const TICKS_PER_SEC: u64 = 1000 / 250;
+            let mut ticks: u64 = 0;
             let mut elapsed: u64 = 0;
+            let mut was_ready = false;
 
             while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(TICK);
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                elapsed += 1;
+                ticks += 1;
+                let prev_elapsed = elapsed;
+                elapsed = ticks / TICKS_PER_SEC;
 
-                // Real input levels from the active capture (0 when none opened).
+                // Real input levels from the active capture (0 when none opened),
+                // and whether capture has actually gone live yet.
                 let mic_level = capture.as_ref().map(|c| c.mic_level()).unwrap_or(0.0);
                 let system_level = capture.as_ref().map(|c| c.system_level()).unwrap_or(0.0);
+                let audio_ready = capture.as_ref().map(|c| c.audio_ready()).unwrap_or(true);
+                if audio_ready && !was_ready {
+                    was_ready = true;
+                    tracing::info!("recorder: audio is now live");
+                }
 
-                if let Some(m) = state.meetings.write().get_mut(&meeting_id) {
-                    m.duration_sec = elapsed;
+                if elapsed != prev_elapsed {
+                    if let Some(m) = state.meetings.write().get_mut(&meeting_id) {
+                        m.duration_sec = elapsed;
+                    }
                 }
                 {
                     let mut st = state.status.write();
                     st.elapsed_sec = elapsed;
                     st.mic_level = mic_level;
                     st.system_level = system_level;
+                    st.audio_ready = st.audio_ready || audio_ready;
                     Events::status(&app, &st);
                 }
             }
@@ -256,8 +278,6 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
 
     session.signal_stop_and_join();
 
-    let clean = state.settings.read().cancel_my_noise;
-
     let (mode, processing) = {
         let mut meetings = state.meetings.write();
         let m = meetings
@@ -285,6 +305,7 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
         st.elapsed_sec = 0;
         st.mic_level = 0.0;
         st.system_level = 0.0;
+        st.audio_ready = false;
         st.message = None;
         st.state = if st.mode == CaptureMode::Off {
             RecorderState::Idle
@@ -301,10 +322,23 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
     std::thread::Builder::new()
         .name("meetapp-finalize".into())
         .spawn(move || {
-            if clean {
+            // Auto-correct the recording before it can be played: AI noise
+            // cancellation first, then loudness enhancement (AGC). This is why the
+            // UI holds the audio as "unavailable" until the meeting is Ready — the
+            // file the user hears is always the corrected one.
+            //
+            // Only for modes that KEEP audio (Record / RecordVideo). Transcribe
+            // mode writes a throwaway temp file it deletes right after making the
+            // transcript, so enhancing it would be wasted work and there is no
+            // audio to play back anyway.
+            if mode.saves_audio() {
                 if let Some(path) = &audio_path {
-                    if let Err(e) = audio::clean_wav_file(std::path::Path::new(path), true) {
-                        tracing::warn!("noise cleaning failed: {e}");
+                    let p = std::path::Path::new(path);
+                    if let Err(e) = audio::clean_wav_file(p, true) {
+                        tracing::warn!("noise cancellation failed: {e}");
+                    }
+                    if let Err(e) = audio::normalize_wav_file(p) {
+                        tracing::warn!("audio enhancement failed: {e}");
                     }
                 }
             }

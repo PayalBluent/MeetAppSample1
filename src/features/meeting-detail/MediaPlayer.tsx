@@ -6,6 +6,9 @@ import {
   RotateCcw,
   RotateCw,
   Video as VideoIcon,
+  Volume1,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { QuickTip } from "@/components/ui/tooltip";
@@ -29,9 +32,24 @@ export function MediaPlayer({
   onMediaEl: (el: HTMLMediaElement | null) => void;
   onOpenFile: () => void;
 }) {
-  const { currentMs, durationMs, playing, toggle, seek, skip, rate, cycleRate } =
-    playback;
+  const {
+    currentMs,
+    durationMs,
+    playing,
+    toggle,
+    seek,
+    skip,
+    rate,
+    cycleRate,
+    volume,
+    muted,
+    setVolume,
+    toggleMute,
+  } = playback;
   const progress = durationMs ? currentMs / durationMs : 0;
+  const effectiveVolume = muted ? 0 : volume;
+  const VolumeIcon =
+    effectiveVolume === 0 ? VolumeX : effectiveVolume < 0.5 ? Volume1 : Volume2;
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-card">
@@ -146,6 +164,30 @@ export function MediaPlayer({
               </Button>
             </QuickTip>
           </div>
+        </div>
+
+        {/* Volume — mute toggle + slider. Own row so it stays visible in the
+            narrow detail sidebar. */}
+        <div className="flex items-center gap-2 pt-0.5">
+          <QuickTip label={muted ? "Unmute" : "Mute"}>
+            <Button variant="ghost" size="icon-sm" onClick={toggleMute}>
+              <VolumeIcon className="size-4" />
+            </Button>
+          </QuickTip>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={effectiveVolume}
+            onChange={(e) => setVolume(parseFloat(e.target.value))}
+            aria-label="Playback volume"
+            className="h-1.5 flex-1 cursor-pointer"
+            style={{ accentColor: "hsl(var(--primary))" }}
+          />
+          <span className="w-9 text-right font-mono text-xs tabular-nums text-muted-foreground">
+            {Math.round(effectiveVolume * 100)}%
+          </span>
         </div>
       </div>
     </div>

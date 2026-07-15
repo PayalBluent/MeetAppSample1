@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
@@ -8,7 +9,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::core::recorder::RecordingSession;
 use crate::models::{
     ActionItem, CaptureMode, Meeting, MeetingPlatform, MeetingStatus, MeetingSummary, Participant,
-    RecorderStatus, Settings, TimelineKind, TimelineMarker, TranscriptSegment,
+    RecorderStatus, Settings, TimelineKind, TimelineMarker, TranscriptSegment, DEFAULT_INPUT_GAIN,
 };
 
 /// Shared, in-memory application state. All fields are independently locked so
@@ -20,6 +21,10 @@ pub struct Inner {
     pub settings: RwLock<Settings>,
     pub status: RwLock<RecorderStatus>,
     pub session: Mutex<Option<RecordingSession>>,
+    /// Capture volume (input gain) as f32 bits, shared live with the audio
+    /// pipeline. Adjusting it via `set_input_gain` takes effect mid-recording
+    /// because the pipeline reads this every buffer.
+    pub recording_gain: Arc<AtomicU32>,
 }
 
 pub type AppState = Arc<Inner>;
@@ -39,6 +44,7 @@ impl Inner {
             settings: RwLock::new(settings),
             status: RwLock::new(RecorderStatus::default()),
             session: Mutex::new(None),
+            recording_gain: Arc::new(AtomicU32::new(DEFAULT_INPUT_GAIN.to_bits())),
         })
     }
 
