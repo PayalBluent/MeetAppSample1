@@ -190,6 +190,18 @@ fn spawn_capture_loop(
             let mut elapsed: u64 = 0;
             let mut was_ready = false;
 
+            // System capture only reflects the output-device mute state on the
+            // endpoint-loopback fallback; process loopback is immune, so we only
+            // watch mute there (and avoid false "you're muted" warnings otherwise).
+            let watch_mute = capture
+                .as_ref()
+                .map(|c| c.system_on_endpoint_fallback())
+                .unwrap_or(false);
+            // The status message set at start (e.g. the exclusive-mic warning); the
+            // mute warning overrides it while muted, then restores it.
+            let base_message = state.status.read().message.clone();
+            let mut system_muted = false;
+
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(TICK);
                 if stop.load(Ordering::Relaxed) {
@@ -198,6 +210,15 @@ fn spawn_capture_loop(
                 ticks += 1;
                 let prev_elapsed = elapsed;
                 elapsed = ticks / TICKS_PER_SEC;
+
+                // Re-check output-device mute about once a second (cheap COM call).
+                if watch_mute && ticks % TICKS_PER_SEC == 0 {
+                    let now_muted = system_output_muted();
+                    if now_muted != system_muted {
+                        system_muted = now_muted;
+                        tracing::info!("system audio: output-device muted = {now_muted}");
+                    }
+                }
 
                 // Real input levels from the active capture (0 when none opened),
                 // and whether capture has actually gone live yet.
@@ -220,6 +241,17 @@ fn spawn_capture_loop(
                     st.mic_level = mic_level;
                     st.system_level = system_level;
                     st.audio_ready = st.audio_ready || audio_ready;
+                    if watch_mute {
+                        st.message = if system_muted {
+                            Some(
+                                "Your speakers are muted, so the other participants' audio isn't \
+                                 being recorded on this PC — unmute to capture system sound."
+                                    .into(),
+                            )
+                        } else {
+                            base_message.clone()
+                        };
+                    }
                     Events::status(&app, &st);
                 }
             }
@@ -333,8 +365,16 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
             // audio to play back anyway.
             if mode.saves_audio() {
                 if let Some(path) = &audio_path {
+                    // Per-channel noise cancellation, driven by the two settings
+                    // toggles: "cancel my noise" → mic side, "cancel others' noise"
+                    // → system/far-end side. Read here so a mid-session change to
+                    // either toggle applies to the recording being finalized.
+                    let (cancel_system, cancel_mic) = {
+                        let s = state2.settings.read();
+                        (s.cancel_others_noise, s.cancel_my_noise)
+                    };
                     let p = std::path::Path::new(path);
-                    if let Err(e) = audio::clean_wav_file(p, true) {
+                    if let Err(e) = audio::clean_wav_file(p, cancel_system, cancel_mic) {
                         tracing::warn!("noise cancellation failed: {e}");
                     }
                     if let Err(e) = audio::normalize_wav_file(p) {
@@ -363,6 +403,18 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
         .ok();
 
     Ok(processing)
+}
+
+/// Whether the default output device is muted right now. Windows-only; always
+/// `false` elsewhere (and only ever consulted on the Windows endpoint-loopback
+/// fallback). Read-only — never changes the system mute state.
+#[cfg(windows)]
+fn system_output_muted() -> bool {
+    crate::platform::windows::system_audio::default_render_muted().unwrap_or(false)
+}
+#[cfg(not(windows))]
+fn system_output_muted() -> bool {
+    false
 }
 
 fn slugify(title: &str) -> String {

@@ -53,6 +53,12 @@ nnnoiseless = { version = "0.5", optional = true }
 windows-capture = { version = "1", optional = true }
 whisper-rs = { version = "0.12", optional = true }
 
+# WebRTC Audio Processing (AEC + AGC + high-pass) for the mic — behind the `apm`
+# feature. Builds a bundled C++ library, so it needs meson + ninja + a C++
+# toolchain and a short build path (see the `apm` feature note below). When it
+# isn't compiled/available the mic path is unchanged and RNNoise is the fallback.
+webrtc-audio-processing = { version = "2", optional = true, features = ["bundled"] }
+
 # Blocking HTTP client for the cloud AI APIs (AssemblyAI transcription, Groq
 # summarization). rustls TLS + JSON support.
 ureq = { version = "2", features = ["json"] }
@@ -71,6 +77,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Threading",
   "Win32_System_Com",
   "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
   "Win32_Media_Multimedia",
 ] }
 # The `#[implement]` macro expands to `windows_core::` paths, so windows-core must
@@ -104,6 +111,13 @@ system-audio = []
 # AI noise suppression (RNNoise). On by default.
 denoise = ["dep:nnnoiseless"]
 
+# WebRTC Audio Processing (AEC + AGC + high-pass) on the mic, with the system
+# audio as the echo reference. Off by default: it builds a bundled C++ library
+# via meson + ninja and needs a short target path on Windows (MAX_PATH). RNNoise
+# stays as the noise-suppression pass either way; this only adds mic AEC/AGC/HPF.
+# Build with:  cargo build --features apm   (meson + ninja on PATH, MSVC env)
+apm = ["dep:webrtc-audio-processing"]
+
 # Screen + video recording on Windows via Windows.Graphics.Capture.
 screen-capture = ["dep:windows-capture"]
 
@@ -117,3 +131,18 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# RNNoise (nnnoiseless) is a neural net run per 10 ms frame; unoptimized it is
+# ~15-20x slower, which made the post-recording "Enhancing…" pass on `app:dev`
+# (debug) take minutes on long recordings. Optimizing just this one dependency —
+# even in dev builds — brings enhancement to near-release speed without slowing
+# the rest of the debug build.
+[profile.dev.package.nnnoiseless]
+opt-level = 3
+
+# The release profile optimizes for size (`opt-level = "s"`), which leaves ~30%
+# of RNNoise throughput on the table. Force speed optimization for just this
+# compute-bound crate so the shipped app enhances audio as fast as possible
+# (~12 s vs ~18 s for a 30-min recording) without bloating the rest of the binary.
+[profile.release.package.nnnoiseless]
+opt-level = 3

@@ -347,8 +347,13 @@ fn cpal_microphone(_tx: Sender<AudioPacket>, _stop: Arc<AtomicBool>) -> Option<J
 }
 
 /// Start system-audio capture, behind a common interface. Only Windows (WASAPI)
-/// is implemented; other platforms return `None` for now.
-pub fn spawn_system_audio(tx: Sender<AudioPacket>, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+/// is implemented; other platforms return `None` for now. On success the bool is
+/// `true` when capture is on the endpoint-loopback fallback (device-bound and
+/// mute-sensitive) rather than the mute-immune process-loopback path.
+pub fn spawn_system_audio(
+    tx: Sender<AudioPacket>,
+    stop: Arc<AtomicBool>,
+) -> Option<(JoinHandle<()>, bool)> {
     #[cfg(windows)]
     {
         crate::platform::windows::system_audio::start(tx, stop)

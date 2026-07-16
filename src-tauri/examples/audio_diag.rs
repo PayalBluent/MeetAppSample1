@@ -255,6 +255,231 @@ fn probe_wasapi() {
             Ok(dev) => probe_init_strategies(&dev, true),
             Err(e) => println!("    GetDefaultAudioEndpoint(eRender) FAILED: {e}"),
         }
+
+        // The decisive test for SYSTEM AUDIO: the app captures system output via
+        // *process loopback* (a virtual device), NOT endpoint loopback. Nothing
+        // above exercises that path, so probe it directly here.
+        println!("\n  === Process loopback (the path the app uses for system audio) ===");
+        probe_process_loopback();
+    }
+}
+
+/// Activate and pump the process-loopback virtual device exactly as the app does
+/// (`ActivateAudioInterfaceAsync` + `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`,
+/// exclude-self), for ~3 s. **Play audio (music / a video) while this runs.**
+/// Prints whether activation and Initialize succeeded and how many packets / what
+/// peak amplitude arrived — i.e. "activated but silent" vs "capturing real audio".
+#[cfg(windows)]
+fn probe_process_loopback() {
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    use windows::core::{implement, Interface, IUnknown, PCWSTR};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Media::Audio::{
+        ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+        IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+        IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+        AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        WAVEFORMATEX,
+    };
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+    const VT_BLOB: u16 = 65;
+
+    #[implement(IActivateAudioInterfaceCompletionHandler)]
+    struct Handler {
+        signal: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl IActivateAudioInterfaceCompletionHandler_Impl for Handler_Impl {
+        fn ActivateCompleted(
+            &self,
+            _op: Option<&IActivateAudioInterfaceAsyncOperation>,
+        ) -> windows::core::Result<()> {
+            let (lock, cvar) = &*self.signal;
+            if let Ok(mut done) = lock.lock() {
+                *done = true;
+            }
+            cvar.notify_all();
+            Ok(())
+        }
+    }
+
+    #[repr(C)]
+    struct PropVariantBlob {
+        vt: u16,
+        r1: u16,
+        r2: u16,
+        r3: u16,
+        cb_size: u32,
+        _pad: u32,
+        blob_data: *mut c_void,
+    }
+
+    unsafe {
+        let mut params = AUDIOCLIENT_ACTIVATION_PARAMS::default();
+        params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+        params.Anonymous.ProcessLoopbackParams.TargetProcessId = std::process::id();
+        params.Anonymous.ProcessLoopbackParams.ProcessLoopbackMode =
+            PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+
+        let blob = PropVariantBlob {
+            vt: VT_BLOB,
+            r1: 0,
+            r2: 0,
+            r3: 0,
+            cb_size: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+            _pad: 0,
+            blob_data: &mut params as *mut _ as *mut c_void,
+        };
+        let propvariant = &blob as *const PropVariantBlob as *const windows::core::PROPVARIANT;
+
+        let signal = Arc::new((Mutex::new(false), Condvar::new()));
+        let handler: IActivateAudioInterfaceCompletionHandler = Handler {
+            signal: signal.clone(),
+        }
+        .into();
+
+        let op: IActivateAudioInterfaceAsyncOperation = match ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &<IAudioClient as Interface>::IID,
+            Some(propvariant),
+            &handler,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                println!("    ActivateAudioInterfaceAsync FAILED: {e} [0x{:08X}]", e.code().0 as u32);
+                println!("    -> process loopback is UNAVAILABLE (older Windows?); app falls back to endpoint loopback");
+                return;
+            }
+        };
+
+        {
+            let (lock, cvar) = &*signal;
+            let mut done = lock.lock().unwrap();
+            let mut waited = 0;
+            while !*done && waited < 50 {
+                let (g, _) = cvar.wait_timeout(done, Duration::from_millis(100)).unwrap();
+                done = g;
+                waited += 1;
+            }
+            if !*done {
+                println!("    activation callback never completed (timeout)");
+                return;
+            }
+        }
+
+        let mut hr = windows::core::HRESULT(0);
+        let mut unknown: Option<IUnknown> = None;
+        if let Err(e) = op.GetActivateResult(&mut hr, &mut unknown) {
+            println!("    GetActivateResult FAILED: {e}");
+            return;
+        }
+        if let Err(e) = hr.ok() {
+            println!("    activation result HRESULT FAILED: {e} [0x{:08X}]", hr.0 as u32);
+            return;
+        }
+        let client: IAudioClient = match unknown.and_then(|u| u.cast().ok()) {
+            Some(c) => c,
+            None => {
+                println!("    activation returned no IAudioClient");
+                return;
+            }
+        };
+        println!("    ActivateAudioInterfaceAsync OK (activated)");
+
+        let format = pcm_format(48_000, 2, 16);
+        if let Err(e) = client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            0,
+            0,
+            &format as *const WAVEFORMATEX,
+            None,
+        ) {
+            println!("    Initialize FAILED: {e} [0x{:08X}]", e.code().0 as u32);
+            return;
+        }
+        println!("    Initialize(LOOPBACK|EVENTCALLBACK, 48k/2ch/16) OK");
+
+        let event = match CreateEventW(None, false, false, PCWSTR::null()) {
+            Ok(h) => h,
+            Err(e) => {
+                println!("    CreateEventW FAILED: {e}");
+                return;
+            }
+        };
+        if let Err(e) = client.SetEventHandle(event) {
+            println!("    SetEventHandle FAILED: {e}");
+            let _ = CloseHandle(event);
+            return;
+        }
+        let capture: IAudioCaptureClient = match client.GetService() {
+            Ok(c) => c,
+            Err(e) => {
+                println!("    GetService(IAudioCaptureClient) FAILED: {e}");
+                let _ = CloseHandle(event);
+                return;
+            }
+        };
+        if let Err(e) = client.Start() {
+            println!("    Start FAILED: {e}");
+            let _ = CloseHandle(event);
+            return;
+        }
+
+        println!("    capturing 3 s — PLAY SOME AUDIO NOW…");
+        let silent_flag = AUDCLNT_BUFFERFLAGS_SILENT.0 as u32;
+        let mut packets = 0u64;
+        let mut peak = 0.0f32;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = WaitForSingleObject(event, 200);
+            loop {
+                let n = match capture.GetNextPacketSize() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        println!("    GetNextPacketSize error: {e}");
+                        break;
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                let mut pdata: *mut u8 = ptr::null_mut();
+                let mut frames: u32 = 0;
+                let mut flags: u32 = 0;
+                if capture
+                    .GetBuffer(&mut pdata, &mut frames, &mut flags, None, None)
+                    .is_err()
+                {
+                    break;
+                }
+                if frames > 0 && !pdata.is_null() && flags & silent_flag == 0 {
+                    let samples =
+                        std::slice::from_raw_parts(pdata as *const i16, frames as usize * 2);
+                    for &s in samples {
+                        peak = peak.max((s as f32 / 32768.0).abs());
+                    }
+                }
+                packets += 1;
+                let _ = capture.ReleaseBuffer(frames);
+            }
+        }
+        let _ = client.Stop();
+        let _ = CloseHandle(event);
+
+        if packets == 0 {
+            println!("    RESULT: activated but delivered NO PACKETS (nothing was playing, or the audio bypasses the mixer)");
+        } else if peak == 0.0 {
+            println!("    RESULT: {packets} packets, but SILENT — was audio actually playing? (all buffers silent)");
+        } else {
+            println!("    RESULT: WORKING — {packets} packets, peak {peak:.4} (real system audio captured)");
+        }
     }
 }
 

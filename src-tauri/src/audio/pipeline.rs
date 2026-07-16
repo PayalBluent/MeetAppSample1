@@ -81,16 +81,25 @@ fn run(
     let mut segs: Vec<SpeakerSegment> = Vec::new();
     let mut last_ms = 0u64;
 
+    // Optional WebRTC APM (AEC/AGC/HPF) on the mic, with the system audio as the
+    // echo reference. `None` when the `apm` feature is off or the processor can't
+    // initialize — in which case the mic passes through untouched and the existing
+    // RNNoise pass (offline) is the noise-suppression fallback.
+    let mut apm = super::apm::Apm::new();
+    if apm.is_some() {
+        tracing::info!("audio: WebRTC APM active on the mic (AEC + AGC + high-pass)");
+    }
+
     loop {
         match rx.recv_timeout(FLUSH) {
             Ok(pkt) => {
-                last_ms = process(&pkt, start, &mut mic, &mut sys, &mut segs);
+                last_ms = process(&pkt, start, &mut mic, &mut sys, &mut segs, &mut apm);
                 // First real audio in hand — signal that capture is live so the UI
                 // can drop its "starting…" state and let the user start/transcribe.
                 audio_ready.store(true, Ordering::Relaxed);
                 // Drain any burst without blocking so we never fall behind.
                 while let Ok(pkt) = rx.try_recv() {
-                    last_ms = process(&pkt, start, &mut mic, &mut sys, &mut segs);
+                    last_ms = process(&pkt, start, &mut mic, &mut sys, &mut segs, &mut apm);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -136,13 +145,14 @@ fn process(
     mic: &mut Channel,
     sys: &mut Channel,
     segs: &mut Vec<SpeakerSegment>,
+    apm: &mut Option<super::apm::Apm>,
 ) -> u64 {
     let now_ms = pkt.timestamp.saturating_duration_since(start).as_millis() as u64;
     let channel = match pkt.source {
         AudioSource::Microphone => mic,
         AudioSource::System => sys,
     };
-    channel.push(pkt, now_ms, segs);
+    channel.push(pkt, now_ms, segs, apm);
     now_ms
 }
 
@@ -233,7 +243,13 @@ impl Channel {
         }
     }
 
-    fn push(&mut self, pkt: &AudioPacket, now_ms: u64, segs: &mut Vec<SpeakerSegment>) {
+    fn push(
+        &mut self,
+        pkt: &AudioPacket,
+        now_ms: u64,
+        segs: &mut Vec<SpeakerSegment>,
+        apm: &mut Option<super::apm::Apm>,
+    ) {
         // Capture volume, read fresh each buffer so the volume control is live.
         let gain = f32::from_bits(self.gain.load(Ordering::Relaxed)).clamp(0.0, MAX_INPUT_GAIN);
 
@@ -269,6 +285,17 @@ impl Channel {
             .get_or_insert_with(|| Resampler::new(pkt.sample_rate, OUT_RATE));
         let mut resampled: Vec<f32> = Vec::new();
         rs.process(&mono, &mut resampled);
+
+        // WebRTC APM stage (only when active). The far end feeds the echo
+        // reference; the mic is echo-cancelled / gain-controlled / high-passed
+        // before anything downstream sees it. When `apm` is `None` this is a
+        // no-op and the samples are unchanged — RNNoise remains the fallback.
+        if let Some(apm) = apm.as_mut() {
+            match pkt.source {
+                AudioSource::System => apm.push_render(&resampled),
+                AudioSource::Microphone => resampled = apm.process_capture(&resampled),
+            }
+        }
 
         let speech_prob = self.detector.update(&resampled);
         let speaking = self.vad.update(speech_prob, level);

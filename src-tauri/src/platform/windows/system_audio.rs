@@ -32,6 +32,7 @@ use windows::Win32::Media::Audio::{
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -57,9 +58,28 @@ enum StreamKind {
 }
 
 /// Start system-audio (loopback) capture on a dedicated thread, sending packets
-/// to `tx`. Blocks until the stream is running; returns the thread handle or `None`.
-pub fn start(tx: Sender<AudioPacket>, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
-    start_with(tx, stop, StreamKind::System, "meetapp-system-audio").map(|(join, _)| join)
+/// to `tx`. Blocks until the stream is running. Returns the thread handle plus
+/// `endpoint_fallback = true` when it had to use classic endpoint loopback (which,
+/// unlike process loopback, is bound to one device and goes silent when the
+/// endpoint is muted) — so the caller can watch for mute on that path.
+pub fn start(tx: Sender<AudioPacket>, stop: Arc<AtomicBool>) -> Option<(JoinHandle<()>, bool)> {
+    start_with(tx, stop, StreamKind::System, "meetapp-system-audio")
+        .map(|(join, info)| (join, info.endpoint_fallback))
+}
+
+/// Whether the default render endpoint (speakers/headphones) is muted right now.
+/// `None` if it can't be determined. This only matters on the endpoint-loopback
+/// fallback: process loopback taps *upstream* of the endpoint mixer, so it keeps
+/// capturing regardless of mute. Read-only — it never changes the mute state.
+pub fn default_render_muted() -> Option<bool> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        let vol: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
+        vol.GetMute().ok().map(|b| b.as_bool())
+    }
 }
 
 /// Start microphone capture through a raw WASAPI capture endpoint. This is the
@@ -115,47 +135,129 @@ fn run(
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-        let stream = match kind {
-            StreamKind::System => match setup_process_loopback() {
-                Ok(s) => {
-                    tracing::info!("system audio: WASAPI process loopback (exclude-self)");
-                    s
-                }
+        // Supervised capture loop. A recording outlives any single audio device:
+        // when the user plugs in / switches the output (or the mic) mid-meeting,
+        // WASAPI invalidates the stream we opened against the old endpoint. Rather
+        // than die silently (the old bug — capture would spin on a dead endpoint and
+        // record nothing for the rest of the session), we tear down and re-open,
+        // re-querying the *current* default device so capture follows the switch.
+        //
+        // Process loopback (the preferred system path) is device-agnostic and
+        // normally never invalidates, so this loop is a no-op for it; it exists to
+        // make the endpoint-loopback fallback and the mic robust to device changes.
+        let mut announced = false;
+        while !stop.load(Ordering::Relaxed) {
+            let stream = match open_stream(kind) {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("process loopback unavailable ({e}); trying endpoint loopback");
-                    setup_endpoint_loopback()?
+                    // The very first open is the caller's success/fail signal (it may
+                    // fall back to cpal). A later open failing means a device is still
+                    // settling after a switch — back off and keep trying until stop.
+                    if !announced {
+                        return Err(e);
+                    }
+                    tracing::warn!("system audio: re-open failed ({e}); retrying");
+                    if sleep_unless_stopped(stop, Duration::from_millis(300)) {
+                        break;
+                    }
+                    continue;
                 }
-            },
-            StreamKind::Microphone => {
-                tracing::info!("microphone: WASAPI capture endpoint");
-                setup_capture_endpoint()?
+            };
+
+            if let Err(e) = stream.client.Start() {
+                let _ = stream.client.Stop();
+                if !announced {
+                    return Err(e.into());
+                }
+                tracing::warn!("system audio: Start failed on re-open ({e}); retrying");
+                if sleep_unless_stopped(stop, Duration::from_millis(300)) {
+                    break;
+                }
+                continue;
             }
-        };
 
-        stream.client.Start()?;
+            // For the microphone, confirm the callback actually delivers PCM before we
+            // report success. A stream can initialize yet never fire — that used to
+            // look like a working mic and record silence; instead we now fail so the
+            // caller falls through to the next path (e.g. cpal). Loopback is exempt: it
+            // legitimately delivers nothing while the speakers are idle. Only gate the
+            // *first* open on this — a re-open after a device change is best-effort.
+            if matches!(kind, StreamKind::Microphone)
+                && !announced
+                && !validate_capture(&stream, tx, Duration::from_millis(1500))
+            {
+                let _ = stream.client.Stop();
+                return Err("capture endpoint opened but delivered no PCM".into());
+            }
 
-        // For the microphone, confirm the callback actually delivers PCM before we
-        // report success. A stream can initialize yet never fire — that used to
-        // look like a working mic and record silence; instead we now fail so the
-        // caller falls through to the next path (e.g. cpal). Loopback is exempt: it
-        // legitimately delivers nothing while the speakers are idle.
-        if matches!(kind, StreamKind::Microphone)
-            && !validate_capture(&stream, tx, Duration::from_millis(1500))
-        {
+            if !announced {
+                announced = true;
+                let _ = ready.send(Ok(CaptureInfo {
+                    exclusive: stream.exclusive,
+                    endpoint_fallback: stream.endpoint_fallback,
+                }));
+            }
+
+            let outcome = pump(&stream, stop, tx);
             let _ = stream.client.Stop();
-            return Err("capture endpoint opened but delivered no PCM".into());
+            // `stream` drops here → its Drop closes the event handle.
+
+            match outcome {
+                PumpOutcome::Stopped => break,
+                PumpOutcome::DeviceChanged => {
+                    tracing::info!(
+                        "system audio: audio device changed — re-opening capture on the new default device"
+                    );
+                    // Give the new default endpoint a moment to become ready.
+                    if sleep_unless_stopped(stop, Duration::from_millis(150)) {
+                        break;
+                    }
+                    continue;
+                }
+            }
         }
-
-        let _ = ready.send(Ok(CaptureInfo {
-            exclusive: stream.exclusive,
-        }));
-
-        pump(&stream, stop, tx);
-
-        let _ = stream.client.Stop();
-        // `stream` drops here → its Drop closes the event handle.
     }
     Ok(())
+}
+
+/// Open (but don't start) a capture stream for `kind`. For system audio this
+/// prefers process loopback — device-independent and immune to the endpoint's
+/// mute/volume because it taps upstream of the endpoint mixer — and only falls
+/// back to classic endpoint loopback (bound to one device, mute-sensitive) when
+/// process loopback can't activate (older Windows, or an activation error).
+unsafe fn open_stream(kind: StreamKind) -> Result<CaptureStream, Box<dyn std::error::Error>> {
+    match kind {
+        StreamKind::System => match setup_process_loopback() {
+            Ok(s) => {
+                tracing::info!("system audio: WASAPI process loopback (exclude-self)");
+                Ok(s)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "system audio: process loopback unavailable ({e}); \
+                     falling back to endpoint loopback (device-bound, mute-sensitive)"
+                );
+                setup_endpoint_loopback()
+            }
+        },
+        StreamKind::Microphone => {
+            tracing::info!("microphone: WASAPI capture endpoint");
+            setup_capture_endpoint()
+        }
+    }
+}
+
+/// Sleep up to `dur`, waking early if `stop` is signaled. Returns `true` if a
+/// stop was requested (so the caller should break out of its supervise loop).
+fn sleep_unless_stopped(stop: &AtomicBool, dur: Duration) -> bool {
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop.load(Ordering::Relaxed)
 }
 
 /// An initialized WASAPI capture stream plus what we need to decode it.
@@ -174,6 +276,10 @@ struct CaptureStream {
     /// engine, so it works on machines with a broken shared-mode enhancement — but
     /// seizes the device, so other apps may lose it). Always false for loopback.
     exclusive: bool,
+    /// True when this is system capture on the classic endpoint-loopback fallback
+    /// (device-bound, mute-sensitive) rather than process loopback. Always false
+    /// for the mic and for process loopback.
+    endpoint_fallback: bool,
 }
 
 /// What a started stream reports back to the caller.
@@ -181,6 +287,8 @@ struct CaptureStream {
 struct CaptureInfo {
     /// The stream is a microphone opened in exclusive mode (see `CaptureStream`).
     exclusive: bool,
+    /// System capture is on the endpoint-loopback fallback (see `CaptureStream`).
+    endpoint_fallback: bool,
 }
 
 impl Drop for CaptureStream {
@@ -193,8 +301,31 @@ impl Drop for CaptureStream {
     }
 }
 
-/// Pull audio until stopped, sending each buffer as a timestamped packet.
-unsafe fn pump(stream: &CaptureStream, stop: &AtomicBool, tx: &Sender<AudioPacket>) {
+/// Why [`pump`] returned — so the supervisor knows whether to finish or re-open.
+enum PumpOutcome {
+    /// Recording is over (stop requested, or the pipeline queue closed).
+    Stopped,
+    /// The device backing this stream went away (unplugged / default switched /
+    /// audio service bounced). The supervisor should re-open on the new default.
+    DeviceChanged,
+}
+
+/// True for the WASAPI errors that mean "this endpoint is gone, re-open on the
+/// current default" rather than "give up". Device-invalidated fires when the
+/// output device is switched or unplugged mid-capture; service-not-running fires
+/// while the Windows Audio service restarts (it comes back).
+fn is_device_lost(hr: windows::core::HRESULT) -> bool {
+    const DEVICE_INVALIDATED: windows::core::HRESULT =
+        windows::core::HRESULT(0x8889_0004u32 as i32);
+    const SERVICE_NOT_RUNNING: windows::core::HRESULT =
+        windows::core::HRESULT(0x8889_0010u32 as i32);
+    hr == DEVICE_INVALIDATED || hr == SERVICE_NOT_RUNNING
+}
+
+/// Pull audio until stopped or the device is lost, sending each buffer as a
+/// timestamped packet. Returns why it stopped so the supervisor can re-open the
+/// capture on the current default device when the device changed underneath us.
+unsafe fn pump(stream: &CaptureStream, stop: &AtomicBool, tx: &Sender<AudioPacket>) -> PumpOutcome {
     let silent_flag = AUDCLNT_BUFFERFLAGS_SILENT.0 as u32;
     let frame_bytes = stream.channels as usize * stream.bytes_per_sample;
 
@@ -209,7 +340,7 @@ unsafe fn pump(stream: &CaptureStream, stop: &AtomicBool, tx: &Sender<AudioPacke
         loop {
             let packet_frames = match stream.capture.GetNextPacketSize() {
                 Ok(p) => p,
-                Err(_) => break,
+                Err(e) => return classify_pump_error(e),
             };
             if packet_frames == 0 {
                 break;
@@ -218,12 +349,11 @@ unsafe fn pump(stream: &CaptureStream, stop: &AtomicBool, tx: &Sender<AudioPacke
             let mut pdata: *mut u8 = ptr::null_mut();
             let mut frames: u32 = 0;
             let mut flags: u32 = 0;
-            if stream
+            if let Err(e) = stream
                 .capture
                 .GetBuffer(&mut pdata, &mut frames, &mut flags, None, None)
-                .is_err()
             {
-                break;
+                return classify_pump_error(e);
             }
 
             if frames > 0 && !pdata.is_null() && frame_bytes > 0 {
@@ -244,12 +374,24 @@ unsafe fn pump(stream: &CaptureStream, stop: &AtomicBool, tx: &Sender<AudioPacke
                 });
                 if send.is_err() {
                     let _ = stream.capture.ReleaseBuffer(frames);
-                    return; // queue closed → recording stopped
+                    return PumpOutcome::Stopped; // queue closed → recording stopped
                 }
             }
 
             let _ = stream.capture.ReleaseBuffer(frames);
         }
+    }
+    PumpOutcome::Stopped
+}
+
+/// Map a capture-read error to a pump outcome: re-open on a lost device, stop on
+/// anything else (better than the old behavior of spinning on a dead endpoint).
+fn classify_pump_error(e: windows::core::Error) -> PumpOutcome {
+    if is_device_lost(e.code()) {
+        PumpOutcome::DeviceChanged
+    } else {
+        tracing::warn!("system audio: capture read error ({e}); stopping this stream");
+        PumpOutcome::Stopped
     }
 }
 
@@ -438,6 +580,7 @@ unsafe fn setup_process_loopback() -> Result<CaptureStream, Box<dyn std::error::
         sample_rate: CAPTURE_RATE,
         source: AudioSource::System,
         exclusive: false,
+        endpoint_fallback: false,
     })
 }
 
@@ -501,6 +644,7 @@ unsafe fn setup_endpoint_loopback() -> Result<CaptureStream, Box<dyn std::error:
         sample_rate,
         source: AudioSource::System,
         exclusive: false,
+        endpoint_fallback: true,
     })
 }
 
@@ -568,6 +712,7 @@ unsafe fn setup_capture_shared(device: &IMMDevice) -> Result<CaptureStream, Box<
         sample_rate,
         source: AudioSource::Microphone,
         exclusive: false,
+        endpoint_fallback: false,
     })
 }
 
@@ -676,6 +821,7 @@ unsafe fn setup_capture_exclusive(device: &IMMDevice) -> Result<CaptureStream, B
             sample_rate: rate,
             source: AudioSource::Microphone,
             exclusive: true,
+            endpoint_fallback: false,
         });
     }
     Err(last_err.into())

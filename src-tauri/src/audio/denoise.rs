@@ -166,10 +166,19 @@ mod rnnoise {
             // Scale [-1, 1] → i16 range that RNNoise expects.
             self.pending.extend(input.iter().map(|s| s * 32768.0));
 
+            // Walk the buffer with a read cursor and drain the consumed prefix
+            // exactly once at the end. Draining 480 samples off the *front* every
+            // frame instead is O(n²) — fine for the small live chunks, but the
+            // offline `clean_wav_file` pass hands us the whole recording in one
+            // call, where that quadratic blowup turned a 30-min file into a ~45-min
+            // "enhancing…" wait. A cursor keeps this linear.
             let mut out = Vec::with_capacity(self.pending.len());
+            let mut frame = [0.0f32; FRAME_SIZE];
             let mut frame_out = [0.0f32; FRAME_SIZE];
-            while self.pending.len() >= FRAME_SIZE {
-                let frame: Vec<f32> = self.pending.drain(0..FRAME_SIZE).collect();
+            let mut consumed = 0usize;
+            while consumed + FRAME_SIZE <= self.pending.len() {
+                frame.copy_from_slice(&self.pending[consumed..consumed + FRAME_SIZE]);
+                consumed += FRAME_SIZE;
                 self.state.process_frame(&mut frame_out, &frame);
                 if !self.discarded_first {
                     self.discarded_first = true; // drop fade-in frame
@@ -177,12 +186,41 @@ mod rnnoise {
                 }
                 out.extend(frame_out.iter().map(|s| (s / 32768.0).clamp(-1.0, 1.0)));
             }
+            self.pending.drain(0..consumed);
             out
         }
 
         fn name(&self) -> &'static str {
             "rnnoise"
         }
+    }
+}
+
+#[cfg(all(test, feature = "denoise"))]
+mod tests {
+    use super::*;
+
+    /// Feeding the whole signal in one call must produce exactly the same output
+    /// as feeding it in arbitrary small chunks — i.e. framing is driven by the
+    /// internal buffer, not by how the caller slices its input. This guards the
+    /// cursor-based traversal that replaced the O(n²) front-drain.
+    #[test]
+    fn one_shot_matches_chunked() {
+        let n = FRAME_SIZE * 50 + 123; // not frame-aligned, so a remainder is held
+        let input: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+
+        let mut one = RnnoiseDenoiser::new();
+        let whole = one.process(&input);
+
+        let mut streamed = RnnoiseDenoiser::new();
+        let mut chunked = Vec::new();
+        for chunk in input.chunks(97) {
+            chunked.extend(streamed.process(chunk));
+        }
+
+        assert_eq!(whole, chunked, "output must not depend on input chunking");
+        // Full 480-sample frames, minus the discarded RNNoise fade-in frame.
+        assert_eq!(whole.len(), (n / FRAME_SIZE - 1) * FRAME_SIZE);
     }
 }
 

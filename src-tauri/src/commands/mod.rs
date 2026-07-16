@@ -340,8 +340,9 @@ pub async fn clean_meeting_audio(
 ) -> AppResult<Meeting> {
     let (path, meeting) = require_available_audio(state.inner(), &id)?;
 
+    // Explicit on-demand action: clean both sides regardless of the toggles.
     tauri::async_runtime::spawn_blocking(move || {
-        crate::audio::clean_wav_file(std::path::Path::new(&path), true)
+        crate::audio::clean_wav_file(std::path::Path::new(&path), true, true)
     })
     .await
     .map_err(|e| AppError::Other(format!("noise-cancellation task failed: {e}")))??;

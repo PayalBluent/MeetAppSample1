@@ -17,6 +17,7 @@
 //! The [`Recorder`] wires these together; the rest of the app only starts/stops
 //! it and reads the input levels.
 
+mod apm;
 mod capture;
 pub mod denoise;
 mod pipeline;
@@ -78,6 +79,10 @@ pub struct Recorder {
     /// on this machine). Surfaced to the UI so it can warn about the conflict with
     /// conferencing apps that exclusive mode implies.
     mic_exclusive: bool,
+    /// True when system capture is on the endpoint-loopback fallback (device-bound,
+    /// mute-sensitive) rather than the mute-immune process-loopback path. When set,
+    /// the recorder watches the output-device mute state and warns on mute.
+    system_endpoint_fallback: bool,
 }
 
 impl Recorder {
@@ -98,10 +103,13 @@ impl Recorder {
             Some((h, exclusive)) => (Some(h), exclusive),
             None => (None, false),
         };
-        let system_join = if capture_system {
-            capture::spawn_system_audio(tx.clone(), stop.clone())
+        let (system_join, system_endpoint_fallback) = if capture_system {
+            match capture::spawn_system_audio(tx.clone(), stop.clone()) {
+                Some((h, fallback)) => (Some(h), fallback),
+                None => (None, false),
+            }
         } else {
-            None
+            (None, false)
         };
         // Drop our own sender so the pipeline's queue disconnects once the
         // capture threads finish — that disconnect is the pipeline's stop signal.
@@ -153,12 +161,20 @@ impl Recorder {
             segments,
             audio_ready,
             mic_exclusive,
+            system_endpoint_fallback,
         })
     }
 
     /// Whether the microphone opened in exclusive mode (see [`Recorder::mic_exclusive`]).
     pub fn mic_exclusive(&self) -> bool {
         self.mic_exclusive
+    }
+
+    /// Whether system capture is on the mute-sensitive endpoint-loopback fallback.
+    /// When true, callers should watch the output-device mute state (a muted
+    /// endpoint makes this path record silence); process loopback is immune.
+    pub fn system_on_endpoint_fallback(&self) -> bool {
+        self.system_endpoint_fallback
     }
 
     /// Whether capture is live yet — `true` once the first audio packet has been
@@ -202,12 +218,21 @@ pub fn wav_path(dir: &Path, slug: &str) -> std::path::PathBuf {
     dir.join(format!("{slug}.wav"))
 }
 
-/// Offline noise-clean a recorded WAV in place: decode → downmix to mono →
-/// resample to 48 kHz → RNNoise → overwrite as 48 kHz mono float WAV. No-op when
-/// `enabled` is false. Never discards the recording (falls back to the raw audio
-/// if suppression yields nothing).
-pub fn clean_wav_file(path: &Path, enabled: bool) -> AppResult<()> {
-    if !enabled {
+/// Offline noise-clean a recorded WAV in place, honoring the two independent
+/// toggles. The recorder writes stereo **L = system ("others"), R = mic ("you")**,
+/// so cleaning is done *per channel*: `cancel_mic` runs RNNoise on the mic side
+/// only, `cancel_system` on the far-end side only. RNNoise is trained on
+/// single-speaker speech, so cleaning the far end (which may be music or several
+/// remote speakers) is deliberately opt-in rather than forced on the whole mix.
+/// The (possibly cleaned) sides are then mixed to a 48 kHz mono file — the most
+/// audible form for playback and transcription.
+///
+/// A no-op when both toggles are off (the later normalize pass still produces the
+/// mono file). Never discards audio: if suppression yields nothing on a side, the
+/// raw side is kept. A mono input (e.g. re-cleaning an already-mixed file) can't
+/// be separated, so it's cleaned as a whole when either toggle is on.
+pub fn clean_wav_file(path: &Path, cancel_system: bool, cancel_mic: bool) -> AppResult<()> {
+    if !cancel_system && !cancel_mic {
         return Ok(());
     }
     let reader = hound::WavReader::open(path).map_err(|e| AppError::Audio(e.to_string()))?;
@@ -231,20 +256,28 @@ pub fn clean_wav_file(path: &Path, enabled: bool) -> AppResult<()> {
         return Ok(());
     }
 
-    let mono: Vec<f32> = if channels <= 1 {
-        samples
+    let mono48: Vec<f32> = if channels >= 2 {
+        // Deinterleave the two recorded sides (channel 0 = system, 1 = mic),
+        // resample each to the 48 kHz RNNoise needs, clean the requested side(s),
+        // then mix down. When only one side is cleaned it is shorter by RNNoise's
+        // one-frame (~10 ms) fade-in; for two distinct speakers mixed to mono that
+        // skew is inaudible, so we align on the shorter length.
+        let frames = samples.len() / channels;
+        let mut system = Vec::with_capacity(frames);
+        let mut mic = Vec::with_capacity(frames);
+        for f in samples.chunks(channels) {
+            system.push(f[0]);
+            mic.push(f.get(1).copied().unwrap_or(0.0));
+        }
+        let system = maybe_denoise(resample_to(&system, spec.sample_rate, 48_000), cancel_system);
+        let mic = maybe_denoise(resample_to(&mic, spec.sample_rate, 48_000), cancel_mic);
+        let n = system.len().min(mic.len());
+        (0..n).map(|i| (system[i] + mic[i]) * 0.5).collect()
     } else {
-        samples
-            .chunks(channels)
-            .map(|f| f.iter().sum::<f32>() / channels as f32)
-            .collect()
+        maybe_denoise(resample_to(&samples, spec.sample_rate, 48_000), true)
     };
-
-    let mono48 = resample_to(&mono, spec.sample_rate, 48_000);
-    let mut denoiser = denoise::make(true);
-    let mut cleaned = denoiser.process(&mono48);
-    if cleaned.is_empty() {
-        cleaned = mono48;
+    if mono48.is_empty() {
+        return Ok(());
     }
 
     let out_spec = hound::WavSpec {
@@ -255,7 +288,7 @@ pub fn clean_wav_file(path: &Path, enabled: bool) -> AppResult<()> {
     };
     let mut writer =
         hound::WavWriter::create(path, out_spec).map_err(|e| AppError::Audio(e.to_string()))?;
-    for s in cleaned {
+    for s in mono48 {
         let pcm = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
         writer
             .write_sample(pcm)
@@ -263,6 +296,21 @@ pub fn clean_wav_file(path: &Path, enabled: bool) -> AppResult<()> {
     }
     writer.finalize().map_err(|e| AppError::Audio(e.to_string()))?;
     Ok(())
+}
+
+/// Run RNNoise over 48 kHz mono when `enabled`, keeping the raw input if
+/// suppression yields nothing; a passthrough when disabled.
+fn maybe_denoise(mono48: Vec<f32>, enabled: bool) -> Vec<f32> {
+    if !enabled {
+        return mono48;
+    }
+    let mut denoiser = denoise::make(true);
+    let cleaned = denoiser.process(&mono48);
+    if cleaned.is_empty() {
+        mono48
+    } else {
+        cleaned
+    }
 }
 
 /// Enhance a recorded WAV **in place** so quiet recordings become clearly audible.
@@ -399,6 +447,70 @@ mod tests {
             segments.len()
         );
         assert!(frames > 48_000 && frames < 48_000 * 5, "frames={frames}");
+    }
+}
+
+#[cfg(test)]
+mod clean_tests {
+    use super::*;
+
+    fn write_stereo(path: &Path, frames: usize) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..frames {
+            // L = system tone, R = mic tone (distinct) so both sides carry signal.
+            let l = (i as f32 * 0.05).sin() * 0.4;
+            let r = (i as f32 * 0.11).sin() * 0.4;
+            w.write_sample((l * i16::MAX as f32) as i16).unwrap();
+            w.write_sample((r * i16::MAX as f32) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    /// Both toggles off is a no-op: the stereo file is left untouched (the later
+    /// normalize pass is what mixes to mono in that case).
+    #[test]
+    fn both_off_is_noop() {
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("clean-noop.wav");
+        let _ = std::fs::remove_file(&path);
+        write_stereo(&path, 48_000);
+
+        clean_wav_file(&path, false, false).expect("no-op should succeed");
+
+        let spec = hound::WavReader::open(&path).unwrap().spec();
+        assert_eq!(spec.channels, 2, "left untouched when both toggles are off");
+    }
+
+    /// Per-channel cleaning collapses the stereo recording to a 48 kHz mono file
+    /// that still contains audio (exercises deinterleave → denoise → mix → write).
+    #[test]
+    fn per_channel_produces_mono_audio() {
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("clean-mono.wav");
+        let _ = std::fs::remove_file(&path);
+        write_stereo(&path, 48_000);
+
+        clean_wav_file(&path, true, true).expect("clean should succeed");
+
+        let reader = hound::WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1, "mixed down to mono");
+        assert_eq!(spec.sample_rate, 48_000);
+        let peak = reader
+            .into_samples::<i16>()
+            .filter_map(Result::ok)
+            .map(|s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 0, "cleaned mono file must still contain audio");
     }
 }
 
