@@ -80,3 +80,18 @@ impl Transcriber for SimulatedTranscriber {
         self.cursor.store(0, Ordering::Relaxed);
     }
 }
+
+/// The full built-in transcript as a one-shot list, used as the offline fallback
+/// when no cloud speech-to-text is configured (see [`crate::core::recorder`]).
+/// Mirrors the browser mock so Transcribe mode produces the same result with or
+/// without the native backend.
+pub fn simulated_segments() -> Vec<TranscriptSegment> {
+    LINES
+        .iter()
+        .enumerate()
+        .map(|(i, (speaker, text))| {
+            let start = i as u64 * 4_000;
+            seg(speaker, text, start, start + 3_500)
+        })
+        .collect()
+}

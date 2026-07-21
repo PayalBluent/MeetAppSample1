@@ -20,7 +20,6 @@ export function DetectionCard({
     <motion.div
       initial={{ opacity: 0, y: -8, scale: 0.98 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, y: -8, scale: 0.98 }}
       className="rounded-xl border border-primary/30 bg-accent/60 p-3"
     >
       <div className="flex items-center gap-2.5">

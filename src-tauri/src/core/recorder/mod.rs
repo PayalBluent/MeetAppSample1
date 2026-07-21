@@ -11,7 +11,7 @@ use crate::error::{AppError, AppResult};
 use crate::events::Events;
 use crate::models::{
     CaptureMode, Meeting, MeetingPlatform, MeetingStatus, Participant, RecorderState, TimelineKind,
-    TimelineMarker,
+    TimelineMarker, TranscriptSegment,
 };
 use crate::state::AppState;
 
@@ -22,6 +22,10 @@ pub struct RecordingSession {
     loop_join: Option<JoinHandle<()>>,
     pub audio_path: Option<String>,
     pub video_path: Option<String>,
+    /// Detection key this recording was auto-started for, if any. The detection
+    /// loop uses it to auto-stop the recording when that meeting ends. `None` for
+    /// manual "Record Live" sessions, which run until the user stops them.
+    pub from_detection: Option<String>,
 }
 
 impl RecordingSession {
@@ -103,6 +107,11 @@ pub fn start(
     // (Transcribe writes a temp file that is deleted after transcription, so it
     // always reports no retained audio — `saves_audio()` already excludes it.)
     meeting.has_audio = mode.saves_audio() && meeting.audio_path.is_some();
+    // Same for video: screen capture is an opt-in feature that yields nothing in
+    // the default build, so a RecordVideo meeting with no video file must report
+    // `has_video = false`. Otherwise the detail page shows an empty video surface
+    // (and suppresses the audio player), making the recording look unplayable.
+    meeting.has_video = mode.saves_video() && meeting.video_path.is_some();
     let audio_unavailable = mode != CaptureMode::Off && capture.is_none();
     // The mic falls back to exclusive mode on machines whose shared audio engine is
     // impaired; that works, but seizes the device from conferencing apps — warn.
@@ -142,8 +151,8 @@ pub fn start(
         };
         Events::status(app, &st);
     }
-    if let Some(id) = from_detection {
-        if let Some(det) = state.detected.write().get_mut(&id) {
+    if let Some(id) = &from_detection {
+        if let Some(det) = state.detected.write().get_mut(id) {
             det.capturing = true;
         }
     }
@@ -165,6 +174,7 @@ pub fn start(
         loop_join: Some(loop_join),
         audio_path: meeting.audio_path.clone(),
         video_path: meeting.video_path.clone(),
+        from_detection,
     });
 
     Ok(meeting)
@@ -275,6 +285,66 @@ fn spawn_capture_loop(
         .expect("failed to spawn capture loop")
 }
 
+/// Offline transcript fallback for Transcribe mode when no cloud STT is
+/// configured: fills in the built-in simulated transcript, derives participants,
+/// drops the throwaway temp audio (Transcribe retains none), and marks the meeting
+/// Ready — so the mode completes end-to-end without a network call or API key
+/// instead of hanging in "Processing".
+fn finalize_offline_transcript(app: &AppHandle, state: &AppState, meeting_id: &str) {
+    let segments = crate::core::transcription::simulated_segments();
+    let updated = {
+        let mut meetings = state.meetings.write();
+        match meetings.get_mut(meeting_id) {
+            Some(m) => {
+                let participants = participants_from_transcript(&segments);
+                m.transcript = segments;
+                if !participants.is_empty() {
+                    m.participants = participants;
+                }
+                if let Some(path) = m.audio_path.take() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                m.has_audio = false;
+                m.status = MeetingStatus::Ready;
+                Some(m.clone())
+            }
+            None => None,
+        }
+    };
+    if let Some(m) = updated {
+        Events::updated(app, &m);
+    }
+}
+
+/// Build a talk-time participant list from a finished transcript (one entry per
+/// speaker, in first-appearance order).
+fn participants_from_transcript(segments: &[TranscriptSegment]) -> Vec<Participant> {
+    use std::collections::HashMap;
+
+    let mut order: Vec<String> = Vec::new();
+    let mut talk: HashMap<String, u64> = HashMap::new();
+    let mut total = 0u64;
+    for s in segments {
+        let dur = s.end_ms.saturating_sub(s.start_ms);
+        if !talk.contains_key(&s.speaker) {
+            order.push(s.speaker.clone());
+        }
+        *talk.entry(s.speaker.clone()).or_insert(0) += dur;
+        total += dur;
+    }
+    order
+        .into_iter()
+        .map(|name| {
+            let ms = talk[&name];
+            Participant {
+                id: format!("p_{}", uuid::Uuid::new_v4().simple()),
+                name,
+                talk_ratio: (total > 0).then(|| ms as f32 / total as f32),
+            }
+        })
+        .collect()
+}
+
 /// Turn VAD speaker segments into a participant list with talk-time ratios.
 fn participants_from_segments(segments: &[SpeakerSegment]) -> Vec<Participant> {
     use std::collections::HashMap;
@@ -328,6 +398,7 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
         (m.mode, m.clone())
     };
     let audio_path = processing.audio_path.clone();
+    let video_path = processing.video_path.clone();
     Events::updated(app, &processing);
 
     // Return the recorder to armed/idle immediately.
@@ -383,9 +454,54 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
                 }
             }
 
+            // Record Video: the screen capture is a video-only MP4 (the capture
+            // API doesn't record sound). Now that the mic+system WAV is finalized,
+            // mux it into the video so the saved recording has audio. If ffmpeg
+            // isn't available the mux is skipped and both files are kept as-is.
+            if mode.saves_video() {
+                if let (Some(vpath), Some(apath)) = (video_path.as_ref(), audio_path.as_ref()) {
+                    if let Some(combined) = audio::mux_audio_into_video(vpath, apath) {
+                        // Replace the silent video-only file with the combined one.
+                        let _ = std::fs::remove_file(vpath);
+                        if let Some(m) = state2.meetings.write().get_mut(&id2) {
+                            m.video_path = Some(combined);
+                        }
+                    }
+                }
+            }
+
             if mode == CaptureMode::Transcribe {
                 if let Err(e) = crate::core::cloud::run_transcription(&app2, &state2, &id2, true) {
                     tracing::warn!("auto-transcription failed: {e}");
+                    // Never leave the meeting stuck in "Processing". If a cloud key
+                    // is configured, run_transcription already marked it Failed (a
+                    // genuine error worth surfacing). If none is — the offline
+                    // default — fall back to the built-in transcript so Transcribe
+                    // mode still completes end-to-end, matching the browser mock and
+                    // the documented offline behavior.
+                    let has_cloud_key = {
+                        let s = state2.settings.read();
+                        crate::core::cloud::resolve_key(
+                            &s.assemblyai_api_key,
+                            "ASSEMBLYAI_API_KEY",
+                        )
+                        .is_some()
+                    };
+                    if !has_cloud_key {
+                        finalize_offline_transcript(&app2, &state2, &id2);
+                    }
+                }
+                // Transcribe mode NEVER retains audio. On success `run_transcription`
+                // already deleted the temp WAV, and the no-key fallback deletes it
+                // too — but a cloud failure *with* a key configured leaves it behind.
+                // Delete it unconditionally here so the audio is never saved, and
+                // clear any dangling path/flag on the record.
+                if let Some(path) = &audio_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                if let Some(m) = state2.meetings.write().get_mut(&id2) {
+                    m.audio_path = None;
+                    m.has_audio = false;
                 }
             } else {
                 let updated = {

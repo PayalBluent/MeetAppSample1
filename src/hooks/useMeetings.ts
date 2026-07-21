@@ -59,6 +59,9 @@ export function useSetMode() {
     onSuccess: (status) => {
       qc.setQueryData(qk.recorderStatus, status);
       qc.invalidateQueries({ queryKey: qk.settings });
+      // Switching to Off clears detections on the backend; refresh so the panel
+      // drops any lingering "meeting detected" cards immediately.
+      qc.invalidateQueries({ queryKey: qk.detected });
     },
   });
 }

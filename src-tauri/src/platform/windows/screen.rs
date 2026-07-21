@@ -15,8 +15,8 @@ use windows_capture::{
     graphics_capture_api::InternalCaptureControl,
     monitor::Monitor,
     settings::{
-        ColorFormat, CursorCaptureSettings, DrawBorderSettings, MinimumUpdateIntervalSettings,
-        SecondaryWindowSettings, Settings,
+        ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+        MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     },
 };
 
@@ -36,9 +36,15 @@ impl GraphicsCaptureApiHandler for Capture {
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         let monitor = Monitor::primary()?;
+        // Video-only: Windows.Graphics.Capture (and this crate) do NOT capture
+        // audio — audio would have to be fed to the encoder frame-by-frame. We
+        // instead record a clean video-only MP4 here and mux in the app's own
+        // mic+system WAV after recording (see `audio::mux_audio_into_video`), so
+        // the saved video ends up with the full meeting audio and there's no
+        // second audio-device grab competing with the WAV pipeline.
         let encoder = VideoEncoder::new(
             VideoSettingsBuilder::new(monitor.width()?, monitor.height()?),
-            AudioSettingsBuilder::default().disabled(false),
+            AudioSettingsBuilder::default().disabled(true),
             ContainerSettingsBuilder::default(),
             &ctx.flags,
         )?;
@@ -84,6 +90,8 @@ pub fn start(dir: &str, slug: &str) -> Option<(ScreenHandle, String)> {
         DrawBorderSettings::Default,
         SecondaryWindowSettings::Default,
         MinimumUpdateIntervalSettings::Default,
+        // windows-capture 1.5 added dirty-region handling as a required argument.
+        DirtyRegionSettings::Default,
         ColorFormat::Rgba8,
         path.clone(),
     );

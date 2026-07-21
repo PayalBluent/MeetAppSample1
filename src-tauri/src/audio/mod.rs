@@ -218,6 +218,50 @@ pub fn wav_path(dir: &Path, slug: &str) -> std::path::PathBuf {
     dir.join(format!("{slug}.wav"))
 }
 
+/// Combine a video-only MP4 with a WAV audio track into a single MP4 (video copied
+/// as-is, audio re-encoded to AAC) using **ffmpeg** if it's on `PATH`. Used for
+/// Record Video, whose screen capture is video-only — this gives the saved video
+/// its sound. Returns the combined file's path on success, or `None` when ffmpeg
+/// isn't installed or the mux fails, so the caller keeps the separate files.
+/// Open-source (ffmpeg); nothing is bundled.
+pub fn mux_audio_into_video(video_mp4: &str, audio_wav: &str) -> Option<String> {
+    use std::process::{Command, Stdio};
+
+    let base = video_mp4.strip_suffix(".mp4").unwrap_or(video_mp4);
+    let out = format!("{base}-av.mp4");
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            video_mp4,
+            "-i",
+            audio_wav,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            &out,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    match status {
+        Ok(s) if s.success() && Path::new(&out).exists() => Some(out.replace('\\', "/")),
+        Ok(_) => {
+            tracing::warn!("ffmpeg A/V mux failed; keeping the separate video + audio files");
+            None
+        }
+        Err(e) => {
+            tracing::info!("ffmpeg not available for A/V mux ({e}); keeping separate files");
+            None
+        }
+    }
+}
+
 /// Offline noise-clean a recorded WAV in place, honoring the two independent
 /// toggles. The recorder writes stereo **L = system ("others"), R = mic ("you")**,
 /// so cleaning is done *per channel*: `cancel_mic` runs RNNoise on the mic side
@@ -269,12 +313,15 @@ pub fn clean_wav_file(path: &Path, cancel_system: bool, cancel_mic: bool) -> App
             system.push(f[0]);
             mic.push(f.get(1).copied().unwrap_or(0.0));
         }
-        let system = maybe_denoise(resample_to(&system, spec.sample_rate, 48_000), cancel_system);
-        let mic = maybe_denoise(resample_to(&mic, spec.sample_rate, 48_000), cancel_mic);
+        // Gate the mic (a single speaker, so the speech-probability residual gate
+        // is safe and effective); leave the far-end ungated — it may be music or
+        // several remote speakers that a single-speaker gate would damage.
+        let system = maybe_denoise(resample_to(&system, spec.sample_rate, 48_000), cancel_system, false);
+        let mic = maybe_denoise(resample_to(&mic, spec.sample_rate, 48_000), cancel_mic, true);
         let n = system.len().min(mic.len());
         (0..n).map(|i| (system[i] + mic[i]) * 0.5).collect()
     } else {
-        maybe_denoise(resample_to(&samples, spec.sample_rate, 48_000), true)
+        maybe_denoise(resample_to(&samples, spec.sample_rate, 48_000), true, true)
     };
     if mono48.is_empty() {
         return Ok(());
@@ -299,12 +346,14 @@ pub fn clean_wav_file(path: &Path, cancel_system: bool, cancel_mic: bool) -> App
 }
 
 /// Run RNNoise over 48 kHz mono when `enabled`, keeping the raw input if
-/// suppression yields nothing; a passthrough when disabled.
-fn maybe_denoise(mono48: Vec<f32>, enabled: bool) -> Vec<f32> {
+/// suppression yields nothing; a passthrough when disabled. `gate` adds the
+/// speech-probability residual gate (mic path); leave it off for the far-end,
+/// whose music / multiple remote speakers a single-speaker gate would damage.
+fn maybe_denoise(mono48: Vec<f32>, enabled: bool, gate: bool) -> Vec<f32> {
     if !enabled {
         return mono48;
     }
-    let mut denoiser = denoise::make(true);
+    let mut denoiser = denoise::make_gated(true, gate);
     let cleaned = denoiser.process(&mono48);
     if cleaned.is_empty() {
         mono48

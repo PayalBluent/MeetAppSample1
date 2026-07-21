@@ -96,7 +96,7 @@ tauri-plugin-autostart = "2"
 # The default build uses only reliable, well-supported crates and is fully
 # functional: real meeting detection, real microphone recording (WAV), and a
 # built-in transcription/summary pipeline. Heavier native backends are opt-in.
-default = ["mic-capture", "denoise"]
+default = ["mic-capture", "denoise", "screen-capture"]
 
 # cpal is now a non-optional dependency; this feature is retained as a no-op so
 # older build invocations and the existing `#[cfg(feature = "mic-capture")]`

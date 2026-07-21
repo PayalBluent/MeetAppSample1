@@ -8,14 +8,12 @@ import {
   RefreshCw,
   Rocket,
   ShieldCheck,
-  Sparkles,
   Stethoscope,
   Sun,
   Waves,
   Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -52,6 +50,7 @@ export function SettingsPage() {
                   key={mode}
                   mode={mode}
                   active={settings.defaultMode === mode}
+                  disabled={mode === "transcribe"}
                   onClick={() => set({ defaultMode: mode })}
                 />
               ))}
@@ -135,38 +134,6 @@ export function SettingsPage() {
               </Button>
             </div>
           </Field>
-        </SettingsSection>
-
-        {/* AI services */}
-        <SettingsSection
-          title="AI Services"
-          icon={<Sparkles className="size-4" />}
-        >
-          <TextField
-            label="AssemblyAI API key"
-            description="Cloud transcription with speaker labels & timestamps. Get a key at assemblyai.com. Tip: set ASSEMBLYAI_API_KEY in the project .env to prefill this."
-            value={settings.assemblyaiApiKey}
-            placeholder="AssemblyAI key"
-            secret
-            onCommit={(v) => set({ assemblyaiApiKey: v })}
-          />
-          <Separator />
-          <TextField
-            label="Groq API key"
-            description="Fast LLM summaries & action items. Get a key at console.groq.com. Tip: set GROQ_API_KEY in the project .env to prefill this."
-            value={settings.groqApiKey}
-            placeholder="gsk_…"
-            secret
-            onCommit={(v) => set({ groqApiKey: v })}
-          />
-          <Separator />
-          <TextField
-            label="Groq model"
-            description="Change if a model is retired (see console.groq.com/docs/models)."
-            value={settings.groqModel}
-            placeholder="llama-3.3-70b-versatile"
-            onCommit={(v) => set({ groqModel: v })}
-          />
         </SettingsSection>
 
         {/* Appearance */}
@@ -378,60 +345,27 @@ function ToggleField({
   );
 }
 
-/** Text/secret input that commits on blur (avoids a mutation per keystroke). */
-function TextField({
-  label,
-  description,
-  value,
-  placeholder,
-  secret,
-  onCommit,
-}: {
-  label: string;
-  description?: string;
-  value: string;
-  placeholder?: string;
-  secret?: boolean;
-  onCommit: (v: string) => void;
-}) {
-  const [v, setV] = useState(value);
-  useEffect(() => setV(value), [value]);
-  return (
-    <Field label={label} description={description}>
-      <Input
-        type={secret ? "password" : "text"}
-        placeholder={placeholder}
-        value={v}
-        onChange={(e) => setV(e.target.value)}
-        onBlur={() => {
-          if (v !== value) onCommit(v.trim());
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-        }}
-        autoComplete="off"
-        spellCheck={false}
-        className="font-mono text-xs"
-      />
-    </Field>
-  );
-}
-
 function ModeChip({
   mode,
   active,
   onClick,
+  disabled,
 }: {
   mode: CaptureMode;
   active: boolean;
   onClick: () => void;
+  disabled?: boolean;
 }) {
   const meta = MODE_META[mode];
   return (
     <button
       onClick={onClick}
+      disabled={disabled}
+      title={
+        disabled ? "Transcription isn't working right now." : undefined
+      }
       className={cn(
-        "no-drag flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors",
+        "no-drag flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
         active
           ? "border-primary bg-primary/10 text-primary"
           : "border-border text-muted-foreground hover:bg-secondary",

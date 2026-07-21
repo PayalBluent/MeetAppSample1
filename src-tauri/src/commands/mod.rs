@@ -70,6 +70,18 @@ pub fn set_mode(app: AppHandle, state: State<'_, AppState>, mode: CaptureMode) -
         }
         st.clone()
     };
+    // Turning off clears any pending detections right away so the panel drops the
+    // "meeting detected" cards immediately, rather than waiting for the detection
+    // loop's next tick to do it.
+    if mode == CaptureMode::Off {
+        let ids: Vec<String> = state.detected.read().keys().cloned().collect();
+        if !ids.is_empty() {
+            state.detected.write().clear();
+            for id in ids {
+                Events::ended(&app, id);
+            }
+        }
+    }
     Events::status(&app, &snapshot);
     snapshot
 }
@@ -82,6 +94,9 @@ pub fn start_capture(
     platform: Option<MeetingPlatform>,
     meeting_id: Option<String>,
 ) -> AppResult<RecorderStatus> {
+    // "Record Live" is an explicit manual action, so it always records — even
+    // when the mode is Off it starts a Record capture. (Off only suppresses the
+    // automatic path: no detection, no auto-record.)
     let mode = {
         let st = state.status.read();
         if st.mode == CaptureMode::Off {

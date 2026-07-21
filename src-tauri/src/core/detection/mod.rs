@@ -13,6 +13,12 @@ use crate::state::AppState;
 /// How often to poll for in-progress meetings.
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
 
+/// Consecutive absent polls before a detected meeting is treated as really ended
+/// and its auto-recording is stopped. Debounces transient detection drops (e.g.
+/// briefly switching browser tabs away from a Google Meet call) so a recording
+/// isn't cut short. At `POLL_INTERVAL` (4s) this is ~8s.
+const END_GRACE_TICKS: u32 = 2;
+
 fn key(platform: MeetingPlatform) -> String {
     format!("det_{platform:?}")
 }
@@ -21,18 +27,24 @@ fn key(platform: MeetingPlatform) -> String {
 pub fn spawn(app: AppHandle, state: AppState) {
     std::thread::Builder::new()
         .name("meetapp-detect".into())
-        .spawn(move || loop {
-            std::thread::sleep(POLL_INTERVAL);
-            tick(&app, &state);
+        .spawn(move || {
+            // Consecutive polls the active auto-recording's source meeting has been
+            // absent; drives the debounced auto-stop (see `END_GRACE_TICKS`).
+            let mut missing_ticks: u32 = 0;
+            loop {
+                std::thread::sleep(POLL_INTERVAL);
+                tick(&app, &state, &mut missing_ticks);
+            }
         })
         .expect("failed to spawn detection loop");
 }
 
-fn tick(app: &AppHandle, state: &AppState) {
+fn tick(app: &AppHandle, state: &AppState, missing_ticks: &mut u32) {
     let mode = state.status.read().mode;
 
     // When the note taker is off, surface no detections.
     if mode == CaptureMode::Off {
+        *missing_ticks = 0;
         clear_all(app, state);
         return;
     }
@@ -92,6 +104,51 @@ fn tick(app: &AppHandle, state: &AppState) {
     for k in removed {
         state.detected.write().remove(&k);
         Events::ended(app, k);
+    }
+
+    // Auto-stop the recording once its source meeting has ended.
+    maybe_auto_stop(app, state, &current, missing_ticks);
+}
+
+/// Stop the recording that was auto-started for a detected meeting once that
+/// meeting's window has been gone for [`END_GRACE_TICKS`] consecutive polls.
+///
+/// Only affects recordings tied to a detection (`RecordingSession::from_detection`);
+/// a manual "Record Live" session has no source detection and is left running
+/// until the user stops it. The grace period debounces flaky detection so a brief
+/// drop (e.g. a tab switch) doesn't end the recording prematurely.
+fn maybe_auto_stop(
+    app: &AppHandle,
+    state: &AppState,
+    current: &HashSet<String>,
+    missing: &mut u32,
+) {
+    // Read (and release) the session lock before calling `recorder::stop`, which
+    // re-locks it.
+    let from_detection = state
+        .session
+        .lock()
+        .as_ref()
+        .and_then(|s| s.from_detection.clone());
+
+    let Some(key) = from_detection else {
+        *missing = 0;
+        return;
+    };
+    if current.contains(&key) {
+        *missing = 0; // meeting still present — reset the grace counter
+        return;
+    }
+
+    *missing += 1;
+    if *missing < END_GRACE_TICKS {
+        return;
+    }
+    *missing = 0;
+    tracing::info!("detected meeting ended — auto-stopping the recording");
+    match recorder::stop(app, state) {
+        Ok(m) => tracing::info!("auto-stopped recording for meeting {}", m.id),
+        Err(e) => tracing::warn!("auto-stop failed: {e}"),
     }
 }
 

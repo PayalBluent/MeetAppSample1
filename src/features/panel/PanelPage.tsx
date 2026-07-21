@@ -137,18 +137,29 @@ export function PanelPage() {
                 onChange={(m) => setMode.mutate(m)}
               />
 
-              {/* Live detections */}
+              {/* The mode is locked while capturing; tell the user how to change it. */}
+              {(recording || processing) && (
+                <p className="text-center text-[11px] text-muted-foreground">
+                  Stop the recording to change the mode.
+                </p>
+              )}
+
+              {/* Live detections — hidden while capturing (feed an empty array,
+                  not a falsy value, so AnimatePresence exits the cards cleanly),
+                  and drop any detection that's already being captured. */}
               <AnimatePresence initial={false}>
-                {!recording &&
-                  detected.map((d) => (
-                    <DetectionCard
-                      key={d.id}
-                      detection={d}
-                      busy={captureDetected.isPending}
-                      onCapture={() => captureDetected.mutate(d.id)}
-                      onDismiss={() => dismissDetected.mutate(d.id)}
-                    />
-                  ))}
+                {(recording || processing
+                  ? []
+                  : detected.filter((d) => !d.capturing)
+                ).map((d) => (
+                  <DetectionCard
+                    key={d.id}
+                    detection={d}
+                    busy={captureDetected.isPending}
+                    onCapture={() => captureDetected.mutate(d.id)}
+                    onDismiss={() => dismissDetected.mutate(d.id)}
+                  />
+                ))}
               </AnimatePresence>
 
               {/* Live recording bar */}

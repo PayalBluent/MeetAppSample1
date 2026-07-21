@@ -96,6 +96,9 @@ class MockBackend {
 
       if (mode === "off") {
         this.clearDetectionSchedule();
+        // Emit `ended` for every open detection before clearing so the UI drops
+        // the cards (mirrors the real backend's detection loop on Off).
+        for (const id of this.detected.keys()) this.bus.emit("meeting://ended", { id });
         this.detected.clear();
         if (this.status.state !== "recording") this.setState("idle");
       } else if (this.status.state === "idle") {
@@ -115,6 +118,8 @@ class MockBackend {
       platform?: Meeting["platform"];
       meetingId?: string;
     }): RecorderStatus => {
+      // "Record Live" is an explicit manual action — always records, starting a
+      // Record capture even when the mode is Off (mirrors the real backend).
       const mode = this.status.mode === "off" ? "record" : this.status.mode;
       this.beginLiveMeeting({
         title: title ?? "Live recording",

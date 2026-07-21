@@ -26,16 +26,24 @@ export function ModeSelector({
         const meta = MODE_META[mode];
         const active = value === mode;
         const isOff = mode === "off";
+        // Transcription isn't working yet — keep the option visible but
+        // unselectable so the user can't switch into a broken mode.
+        const unavailable = mode === "transcribe";
         return (
           <button
             key={mode}
             role="tab"
             aria-selected={active}
-            disabled={disabled}
+            aria-disabled={unavailable || undefined}
+            disabled={disabled || unavailable}
             onClick={() => onChange(mode)}
-            title={meta.description}
+            title={
+              unavailable
+                ? "Transcription isn't working right now."
+                : meta.description
+            }
             className={cn(
-              "no-drag relative flex h-14 flex-col items-center justify-center gap-1 rounded-lg text-[11px] font-medium transition-colors disabled:opacity-50",
+              "no-drag relative flex h-14 flex-col items-center justify-center gap-1 rounded-lg text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
               active
                 ? isOff
                   ? "text-destructive-foreground"
