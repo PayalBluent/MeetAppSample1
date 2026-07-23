@@ -15,19 +15,16 @@ use crate::state::AppState;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Consecutive absent polls before a detected meeting is treated as really ended
-/// and its auto-recording is stopped. This MUST be generous: during a live meeting
-/// the title-based detector only *intermittently* matches — the pre-join and
-/// compact-view titles carry a "meeting"/"call" token, but the in-call window
-/// title frequently does not, and screen share / view switches drop it too. The
-/// meeting only stays "recorded" because those intermittent matches keep resetting
-/// this counter, so the grace has to be long enough to bridge the gaps between
-/// them. A short grace stopped recordings mid-call (observed: real Teams meetings
-/// auto-stopping after ~30-50s). The classifier no longer matches finished-meeting
-/// states (the Google Meet home / "you left" screen, the Teams "Calls" tab), so a
-/// genuinely ended meeting still stays absent for the full grace and auto-stops.
-/// At `POLL_INTERVAL` (2s) this is ~92s — the value proven to ride out in-meeting
-/// title churn while still ending a finished meeting within a minute and a half.
-const END_GRACE_TICKS: u32 = 46;
+/// and its auto-recording is stopped. Absence here is measured with the *lenient*
+/// active-platform check ([`platform::detect::active_platforms`]), which stays true
+/// for the whole call (it recognises an in-call window even after its title drops
+/// the "meeting"/"call" token) and only goes false once the app returns to an idle
+/// state. Because that signal reliably tracks the meeting, this grace only has to
+/// debounce the brief moment the meeting window closes — not bridge long in-call
+/// title gaps — so it can be short. At `POLL_INTERVAL` (2s) this is ~8s: the
+/// recording stops within roughly 8-10s of the meeting actually ending, while two
+/// extra polls of margin keep a momentary flicker from ever ending it early.
+const END_GRACE_TICKS: u32 = 4;
 
 fn key(platform: MeetingPlatform) -> String {
     format!("det_{platform:?}")
@@ -138,8 +135,19 @@ fn tick(app: &AppHandle, state: &AppState, missing_ticks: &mut u32) {
         Events::ended(app, k);
     }
 
-    // Auto-stop the recording once its source meeting has ended.
-    maybe_auto_stop(app, state, &current, missing_ticks);
+    // Auto-stop the recording once its source meeting has ended. This uses the
+    // *lenient* active-platform set, not the strict `current` above: during a call
+    // a Teams window title often drops the "meeting"/"call" token, and the strict
+    // set would then think the meeting ended and cut the recording off mid-call.
+    // The lenient set keeps an in-call window alive and only drops once the app is
+    // back on an idle nav section — so the recording spans the whole meeting and
+    // stops shortly after it truly ends. New detections above stay on `current`
+    // (strict), so nothing is ever *started* falsely.
+    let active_keys: HashSet<String> = platform::detect::active_platforms()
+        .into_iter()
+        .map(key)
+        .collect();
+    maybe_auto_stop(app, state, &active_keys, missing_ticks);
 
     // Keep the status pill honest: while the note taker is active (armed mode or
     // auto-record on) and nothing is currently being captured, show "Armed" (it's

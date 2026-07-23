@@ -27,6 +27,72 @@ pub fn scan() -> Vec<Candidate> {
     found.into_values().collect()
 }
 
+/// Platforms that currently look like they have an **active** meeting, using a
+/// *lenient* check — the one the auto-stop consults to decide whether a running
+/// recording should keep going. It is a superset of [`scan`]'s strict result: in
+/// addition to the join / pre-call / compact-view windows that carry a
+/// "meeting"/"call" token, it treats a Teams **in-call** window (whose title has
+/// become the meeting subject and dropped that token) as still-active, so a
+/// recording is not cut off mid-call. It returns to *not* active once Teams is back
+/// on an idle navigation section (Calendar, Chat, Calls, …), so a finished meeting
+/// still auto-stops.
+///
+/// Recordings are only ever *started* from [`scan`]/`classify` (strict), never from
+/// here — so this lenient view cannot cause a false recording, only keep a real one
+/// alive through the call.
+pub fn active_platforms() -> HashSet<MeetingPlatform> {
+    let procs = running_process_names();
+    let titles = visible_window_titles();
+
+    let mut set: HashSet<MeetingPlatform> = HashSet::new();
+    for title in &titles {
+        if let Some(p) = classify(&title.to_lowercase(), &procs) {
+            set.insert(p);
+        }
+    }
+
+    // Lenient Teams continue-check: an in-call window keeps the meeting active even
+    // after its title drops the meeting/call token.
+    let has = |name: &str| procs.iter().any(|p| p.contains(name));
+    if (has("teams") || has("ms-teams"))
+        && titles.iter().any(|t| teams_in_call(&t.to_lowercase()))
+    {
+        set.insert(MeetingPlatform::Teams);
+    }
+    set
+}
+
+/// Whether a (lower-cased) Teams window title looks like an **in-call** window
+/// rather than the idle app shell. Used only by [`active_platforms`] (the auto-stop
+/// continue-check), never to start a recording. A Teams in-call window is titled
+/// with the meeting subject ("&lt;subject&gt; | Microsoft Teams"); the idle app sits
+/// on a known navigation section (Calendar, Chat, Calls, …). So a Teams window whose
+/// leading segment is a non-empty, non-nav string is treated as in-call.
+fn teams_in_call(lower: &str) -> bool {
+    let Some(pos) = lower.find("microsoft teams") else {
+        return false;
+    };
+    // Text before "microsoft teams", trailing separators/whitespace stripped.
+    let lead = lower[..pos].trim_matches(|c: char| {
+        c.is_whitespace() || c == '|' || c == '-' || c == '\u{00b7}'
+    });
+    if lead.is_empty() {
+        return false; // bare "Microsoft Teams" — startup / idle, not a call
+    }
+    // The section name is the last "| "-separated segment.
+    let section = lead
+        .rsplit(|c| c == '|' || c == '-' || c == '\u{00b7}')
+        .next()
+        .unwrap_or(lead)
+        .trim();
+    // Idle navigation sections — the app is not in a call when it's on one of these.
+    const NAV: &[&str] = &[
+        "activity", "chat", "calendar", "calls", "teams", "files", "apps", "help",
+        "communities", "store", "settings", "more", "home", "shifts", "tasks",
+    ];
+    !NAV.contains(&section)
+}
+
 fn classify(title: &str, procs: &HashSet<String>) -> Option<MeetingPlatform> {
     let has = |name: &str| procs.iter().any(|p| p.contains(name));
     let browser = has("chrome")
@@ -164,6 +230,29 @@ mod tests {
     fn ignores_zoom_home_window() {
         // Zoom's home window ("Zoom Workplace") is not an active call.
         assert_eq!(classify("zoom workplace", &procs(&["zoom.exe"])), None);
+    }
+
+    #[test]
+    fn teams_in_call_keeps_subject_window_active() {
+        // In-call windows are titled with the meeting subject (no meeting/call
+        // token) — the auto-stop must still treat these as an active meeting.
+        assert!(teams_in_call("weekly sync | microsoft teams"));
+        assert!(teams_in_call("q3 planning - roadmap | microsoft teams"));
+        assert!(teams_in_call("meeting compact view - jitesh - microsoft teams"));
+    }
+
+    #[test]
+    fn teams_in_call_treats_idle_nav_as_ended() {
+        // Idle navigation sections mean no active call — the recording should stop.
+        for t in [
+            "calendar | microsoft teams",
+            "chat | microsoft teams",
+            "calls | microsoft teams",
+            "activity | microsoft teams",
+            "microsoft teams", // bare startup window
+        ] {
+            assert!(!teams_in_call(t), "should be idle: {t}");
+        }
     }
 
     #[test]
