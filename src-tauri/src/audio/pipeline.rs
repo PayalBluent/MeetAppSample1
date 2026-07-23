@@ -41,6 +41,9 @@ pub fn spawn(
     segments: Arc<Mutex<Vec<SpeakerSegment>>>,
     audio_ready: Arc<AtomicBool>,
     gain: Arc<AtomicU32>,
+    // Set while the user has the microphone muted: the mic channel is recorded as
+    // silence and opens no speaker segments; the system channel is unaffected.
+    mic_muted: Arc<AtomicBool>,
 ) -> Option<JoinHandle<()>> {
     let spec = hound::WavSpec {
         channels: 2,
@@ -60,7 +63,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("meetapp-audio-pipeline".into())
         .spawn(move || {
-            run(rx, writer, path, start, mic_level, sys_level, segments, audio_ready, gain)
+            run(rx, writer, path, start, mic_level, sys_level, segments, audio_ready, gain, mic_muted)
         })
         .ok()
 }
@@ -75,9 +78,10 @@ fn run(
     segments: Arc<Mutex<Vec<SpeakerSegment>>>,
     audio_ready: Arc<AtomicBool>,
     gain: Arc<AtomicU32>,
+    mic_muted: Arc<AtomicBool>,
 ) {
-    let mut mic = Channel::new("You", mic_level, gain.clone());
-    let mut sys = Channel::new("Remote", sys_level, gain);
+    let mut mic = Channel::new("You", mic_level, gain.clone(), Some(mic_muted));
+    let mut sys = Channel::new("Remote", sys_level, gain, None);
     let mut segs: Vec<SpeakerSegment> = Vec::new();
     let mut last_ms = 0u64;
 
@@ -225,10 +229,19 @@ struct Channel {
     /// how many packets actually arrived on this source.
     peak: f32,
     packets: u64,
+    /// `Some` on the microphone channel: while this flag is set the user has muted
+    /// the mic, so the channel is recorded as silence and opens no speaker segment.
+    /// `None` on the system channel, which is never gated by the mic mute.
+    muted: Option<Arc<AtomicBool>>,
 }
 
 impl Channel {
-    fn new(speaker: &'static str, level: Arc<AtomicU32>, gain: Arc<AtomicU32>) -> Self {
+    fn new(
+        speaker: &'static str,
+        level: Arc<AtomicU32>,
+        gain: Arc<AtomicU32>,
+        muted: Option<Arc<AtomicBool>>,
+    ) -> Self {
         Channel {
             level,
             gain,
@@ -240,6 +253,7 @@ impl Channel {
             primed: false,
             peak: 0.0,
             packets: 0,
+            muted,
         }
     }
 
@@ -252,17 +266,30 @@ impl Channel {
     ) {
         // Capture volume, read fresh each buffer so the volume control is live.
         let gain = f32::from_bits(self.gain.load(Ordering::Relaxed)).clamp(0.0, MAX_INPUT_GAIN);
+        // Is the user muting this channel's source right now? Only ever true on the
+        // microphone channel (the system channel is created with `muted = None`).
+        let muted = self
+            .muted
+            .as_ref()
+            .map(|m| m.load(Ordering::Relaxed))
+            .unwrap_or(false);
 
         let mono = downmix(&pkt.samples, pkt.channels);
         // `level` is the raw (pre-gain) loudness — used for the speech-detection
         // energy floor and the "was anything captured?" verdict, so neither is
         // skewed by the volume setting. The meter shows the *boosted* level so the
-        // user sees the effect of the control.
+        // user sees the effect of the control. While muted the mic contributes
+        // nothing: the meter reads 0 and the (possibly non-zero) raw buffer never
+        // counts toward the capture-verdict peak.
         let level = rms(&mono);
-        self.level.store((level * gain * 3.0).min(1.0).to_bits(), Ordering::Relaxed);
         self.packets += 1;
-        if level > self.peak {
-            self.peak = level;
+        if muted {
+            self.level.store(0.0f32.to_bits(), Ordering::Relaxed);
+        } else {
+            self.level.store((level * gain * 3.0).min(1.0).to_bits(), Ordering::Relaxed);
+            if level > self.peak {
+                self.peak = level;
+            }
         }
 
         // Align sources to a shared t = 0 (the recorder's start instant). A stream
@@ -277,14 +304,27 @@ impl Channel {
         }
 
         // Resample to 48 kHz first: RNNoise's speech detector requires that rate,
-        // and it's the WAV's rate anyway. Then detect *speech* on the resampled
-        // mono and gate segmentation on the trained probability (not loudness),
-        // so music/typing/hum never open a speaker segment.
+        // and it's the WAV's rate anyway. We always resample — even when muted — so
+        // the frame count enqueued matches the system channel and the two stereo
+        // sides stay time-aligned.
         let rs = self
             .resampler
             .get_or_insert_with(|| Resampler::new(pkt.sample_rate, OUT_RATE));
         let mut resampled: Vec<f32> = Vec::new();
         rs.process(&mono, &mut resampled);
+
+        // Microphone muted: record silence on this channel, keep any open "You"
+        // segment closed (and open no new one), and stop here — no VAD, no echo
+        // cancellation, no gain. The system channel is a separate `Channel` that is
+        // never muted, so system audio keeps being recorded exactly as before.
+        if muted {
+            for s in resampled.iter_mut() {
+                *s = 0.0;
+            }
+            self.seg.update(false, now_ms, segs);
+            self.q.extend(resampled);
+            return;
+        }
 
         // WebRTC APM stage (only when active). The far end feeds the echo
         // reference; the mic is echo-cancelled / gain-controlled / high-passed
@@ -468,6 +508,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("pipeline should start");
 
@@ -500,6 +541,133 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(peak > 1000, "WAV must contain non-zero audio, peak={peak}");
+    }
+
+    /// With the mic muted, only system audio is recorded: the stereo WAV's left
+    /// (system) channel carries audio while the right (mic) channel stays perfectly
+    /// silent — even though the mic source delivered loud PCM the whole time.
+    #[test]
+    fn muted_mic_records_only_system_audio() {
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("pipeline-muted-mic.wav");
+        let _ = std::fs::remove_file(&path);
+
+        let mic_muted = Arc::new(AtomicBool::new(true)); // muted for the whole run
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        let handle = spawn(
+            rx,
+            &path,
+            start,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            mic_muted,
+        )
+        .expect("pipeline should start");
+
+        // Loud mic AND loud system packets, interleaved, all 48 kHz mono.
+        for chunk in 0..50 {
+            let mk = |phase: f32| -> Vec<f32> {
+                (0..480)
+                    .map(|i| ((chunk * 480 + i) as f32 * phase).sin() * 0.5)
+                    .collect()
+            };
+            tx.send(AudioPacket {
+                timestamp: Instant::now(),
+                sample_rate: 48_000,
+                channels: 1,
+                samples: mk(0.06),
+                source: AudioSource::Microphone,
+            })
+            .unwrap();
+            tx.send(AudioPacket {
+                timestamp: Instant::now(),
+                sample_rate: 48_000,
+                channels: 1,
+                samples: mk(0.05),
+                source: AudioSource::System,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        handle.join().unwrap();
+
+        // L = system, R = mic.
+        let reader = hound::WavReader::open(&path).expect("WAV should exist");
+        assert_eq!(reader.spec().channels, 2);
+        let samples: Vec<i16> = reader.into_samples::<i16>().filter_map(Result::ok).collect();
+        let (mut sys_peak, mut mic_peak) = (0u16, 0u16);
+        for frame in samples.chunks(2) {
+            if frame.len() < 2 {
+                break;
+            }
+            sys_peak = sys_peak.max(frame[0].unsigned_abs());
+            mic_peak = mic_peak.max(frame[1].unsigned_abs());
+        }
+        assert!(sys_peak > 1000, "system (left) channel must carry audio, peak={sys_peak}");
+        assert_eq!(mic_peak, 0, "muted mic (right) channel must be silent, peak={mic_peak}");
+    }
+
+    /// Muting the mic *mid-recording* takes effect immediately and reverses on
+    /// unmute: samples recorded while unmuted carry audio, samples recorded while
+    /// muted are silence (but are still enqueued, keeping the channels aligned), and
+    /// unmuting records audio again. Exercised at the `Channel` level so the mute
+    /// toggle point is deterministic (no dependence on pipeline thread timing).
+    #[test]
+    fn mic_channel_mutes_and_unmutes_mid_stream() {
+        let muted = Arc::new(AtomicBool::new(false));
+        let mut ch = Channel::new(
+            "You",
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Some(muted.clone()),
+        );
+        let mut segs: Vec<SpeakerSegment> = Vec::new();
+        let mut apm: Option<crate::audio::apm::Apm> = None;
+
+        let loud = || AudioPacket {
+            timestamp: Instant::now(),
+            sample_rate: 48_000,
+            channels: 1,
+            samples: (0..480).map(|i| (i as f32 * 0.06).sin() * 0.5).collect(),
+            source: AudioSource::Microphone,
+        };
+        let appended = |ch: &Channel, before: usize| -> Vec<f32> {
+            ch.q.iter().skip(before).copied().collect()
+        };
+
+        // Unmuted → audio is recorded.
+        let n = ch.q.len();
+        ch.push(&loud(), 0, &mut segs, &mut apm);
+        assert!(
+            appended(&ch, n).iter().any(|&s| s.abs() > 0.01),
+            "unmuted mic must record audio"
+        );
+
+        // Mute mid-stream → silence, but frames are still enqueued (alignment kept).
+        muted.store(true, Ordering::Relaxed);
+        let n = ch.q.len();
+        ch.push(&loud(), 10, &mut segs, &mut apm);
+        let while_muted = appended(&ch, n);
+        assert!(!while_muted.is_empty(), "muted mic still enqueues frames");
+        assert!(
+            while_muted.iter().all(|&s| s == 0.0),
+            "muted mic must record pure silence"
+        );
+
+        // Unmute → audio is recorded again.
+        muted.store(false, Ordering::Relaxed);
+        let n = ch.q.len();
+        ch.push(&loud(), 20, &mut segs, &mut apm);
+        assert!(
+            appended(&ch, n).iter().any(|&s| s.abs() > 0.01),
+            "unmuting records audio again"
+        );
     }
 
     #[test]

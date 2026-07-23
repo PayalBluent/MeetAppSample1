@@ -47,6 +47,7 @@ class MockBackend {
     elapsedSec: 0,
     micLevel: 0,
     systemLevel: 0,
+    micMuted: false,
     inputGain: 1.5,
     audioReady: false,
     message: null,
@@ -135,6 +136,13 @@ class MockBackend {
     set_input_gain: ({ gain }: { gain: number }): RecorderStatus => {
       const clamped = Number.isFinite(gain) ? Math.min(3, Math.max(0, gain)) : 1;
       this.status.inputGain = clamped;
+      this.emitStatus();
+      return { ...this.status };
+    },
+
+    set_mic_mute: ({ muted }: { muted: boolean }): RecorderStatus => {
+      this.status.micMuted = muted;
+      if (muted) this.status.micLevel = 0;
       this.emitStatus();
       return { ...this.status };
     },
@@ -385,7 +393,8 @@ class MockBackend {
       const base = 0.25 + Math.random() * 0.4;
       const sysBase =
         opts.mode === "transcribe" ? 0.15 + Math.random() * 0.2 : 0.3 + Math.random() * 0.35;
-      this.status.micLevel = Math.min(1, base * g);
+      // A muted mic records silence, so its meter reads 0; system keeps going.
+      this.status.micLevel = this.status.micMuted ? 0 : Math.min(1, base * g);
       this.status.systemLevel = Math.min(1, sysBase * g);
       this.emitStatus();
     }, 1_000);

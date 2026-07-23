@@ -14,10 +14,60 @@ use tauri::{Manager, WindowEvent};
 
 use state::{AppState, Inner};
 
+/// A shared, append-only log file usable as a `tracing` writer from every thread.
+struct SharedLogFile(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+
+impl std::io::Write for SharedLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.lock() {
+            Ok(mut f) => f.write(buf),
+            Err(_) => Ok(buf.len()),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.lock() {
+            Ok(mut f) => f.flush(),
+            Err(_) => Ok(()),
+        }
+    }
+}
+
 fn init_tracing() {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+
+    // Mirror logs to ~/MeetApp/logs/meetapp.log so capture diagnostics — in
+    // particular the pipeline's per-source "recording finalized: mic[...],
+    // system[...]" verdict — are readable even from a packaged build with no
+    // attached console. Falls back to stdout-only if the file can't be opened.
+    let log_file = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("MeetApp")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_file);
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file.join("meetapp.log"))
+        .ok()
+        .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)));
+
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    match opened {
+        Some(file) => {
+            let make_file = move || SharedLogFile(file.clone());
+            let _ = builder
+                .with_ansi(false)
+                .with_writer(std::io::stdout.and(make_file))
+                .try_init();
+        }
+        None => {
+            let _ = builder.try_init();
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -66,8 +116,14 @@ pub fn run() {
                 .join("recordings");
             let _ = std::fs::create_dir_all(&save_dir);
 
-            let state: AppState = Inner::new(save_dir);
+            let state: AppState = Inner::new(save_dir.clone());
             app.manage(state.clone());
+
+            // Load previously-saved recordings (and import any media already in the
+            // folder that has no metadata yet) so the user's past recordings show up
+            // and remain accessible across restarts. Existing recordings are never
+            // modified — only their sidecar metadata is read or, for orphans, added.
+            state.load_persisted_recordings(&save_dir);
 
             // System tray + background detection.
             tray::build(&handle)?;
@@ -102,6 +158,7 @@ pub fn run() {
             commands::start_capture,
             commands::stop_capture,
             commands::set_input_gain,
+            commands::set_mic_mute,
             commands::enhance_meeting_audio,
             commands::clean_meeting_audio,
             commands::capture_detected,

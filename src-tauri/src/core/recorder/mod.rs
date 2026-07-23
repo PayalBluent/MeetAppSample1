@@ -53,6 +53,12 @@ pub fn start(
         return Err(AppError::AlreadyRecording);
     }
 
+    // Every recording starts with the mic live; the user opts into muting during
+    // the session. Clears any manual mute left over from a previous recording.
+    state
+        .manual_mic_mute
+        .store(false, Ordering::Relaxed);
+
     let mut meeting = Meeting::new_live(title, platform, mode);
     let (save_dir, capture_system_audio) = {
         let s = state.settings.read();
@@ -129,6 +135,7 @@ pub fn start(
         st.mode = mode;
         st.active_meeting_id = Some(meeting_id.clone());
         st.elapsed_sec = 0;
+        st.mic_muted = false;
         st.input_gain = f32::from_bits(state.recording_gain.load(Ordering::Relaxed));
         // Not live yet — the capture loop flips this on once audio actually flows.
         // If no device opened at all, there's nothing to wait for, so report ready.
@@ -211,6 +218,10 @@ fn spawn_capture_loop(
             // mute warning overrides it while muted, then restores it.
             let base_message = state.status.read().message.clone();
             let mut system_muted = false;
+            // Whether the user currently has the microphone muted. Polled each
+            // second and pushed to the pipeline, which then records the mic as
+            // silence (system audio keeps recording).
+            let mut mic_muted = false;
 
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(TICK);
@@ -227,6 +238,26 @@ fn spawn_capture_loop(
                     if now_muted != system_muted {
                         system_muted = now_muted;
                         tracing::info!("system audio: output-device muted = {now_muted}");
+                    }
+                }
+
+                // Re-check the microphone mute every tick (250 ms) and push it to
+                // the pipeline, so muting/unmuting takes effect almost immediately.
+                // The mic counts as muted when EITHER the OS/device is muted OR the
+                // user muted it in-app (`set_mic_mute`) — the latter is what makes a
+                // Teams/Zoom in-app mute actually stop the recording, since those
+                // never touch the Windows endpoint. While muted, the pipeline records
+                // the mic as silence and opens no "You" segment; system audio keeps
+                // recording. Runs regardless of the system-mute watch above.
+                {
+                    let now_mic_muted = microphone_muted()
+                        || state.manual_mic_mute.load(Ordering::Relaxed);
+                    if let Some(c) = capture.as_ref() {
+                        c.set_mic_muted(now_mic_muted);
+                    }
+                    if now_mic_muted != mic_muted {
+                        mic_muted = now_mic_muted;
+                        tracing::info!("microphone: user mute = {mic_muted}");
                     }
                 }
 
@@ -248,8 +279,11 @@ fn spawn_capture_loop(
                 {
                     let mut st = state.status.write();
                     st.elapsed_sec = elapsed;
-                    st.mic_level = mic_level;
+                    // While muted, force the mic meter to 0 immediately (the pipeline
+                    // also zeroes it, but polling lags by up to a second).
+                    st.mic_level = if mic_muted { 0.0 } else { mic_level };
                     st.system_level = system_level;
+                    st.mic_muted = mic_muted;
                     st.audio_ready = st.audio_ready || audio_ready;
                     if watch_mute {
                         st.message = if system_muted {
@@ -408,6 +442,7 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
         st.elapsed_sec = 0;
         st.mic_level = 0.0;
         st.system_level = 0.0;
+        st.mic_muted = false;
         st.audio_ready = false;
         st.message = None;
         st.state = if st.mode == CaptureMode::Off {
@@ -447,6 +482,16 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
                     let p = std::path::Path::new(path);
                     if let Err(e) = audio::clean_wav_file(p, cancel_system, cancel_mic) {
                         tracing::warn!("noise cancellation failed: {e}");
+                    }
+                    // Trim leading/trailing dead air before enhancing, so the AGC
+                    // boost is measured over real content and silence is judged
+                    // before the boost lifts the noise floor. Skipped for video: the
+                    // A/V mux uses ffmpeg `-shortest`, so a shortened audio track
+                    // would truncate the video.
+                    if !mode.saves_video() {
+                        if let Err(e) = audio::trim_silence_wav_file(p) {
+                            tracing::warn!("silence trim failed: {e}");
+                        }
                     }
                     if let Err(e) = audio::normalize_wav_file(p) {
                         tracing::warn!("audio enhancement failed: {e}");
@@ -512,6 +557,9 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
                     })
                 };
                 if let Some(m) = updated {
+                    // Persist the finished recording's metadata so it survives a
+                    // restart and shows up in the library next launch.
+                    state2.persist_meeting(&m);
                     Events::updated(&app2, &m);
                 }
             }
@@ -530,6 +578,19 @@ fn system_output_muted() -> bool {
 }
 #[cfg(not(windows))]
 fn system_output_muted() -> bool {
+    false
+}
+
+/// Whether the microphone (default capture endpoint) is muted at the OS/device
+/// level right now. Windows-only; always `false` elsewhere. When it can't be
+/// determined we treat the mic as *not* muted, so an inability to read the mute
+/// state never silently drops the microphone. Read-only.
+#[cfg(windows)]
+fn microphone_muted() -> bool {
+    crate::platform::windows::system_audio::default_capture_muted().unwrap_or(false)
+}
+#[cfg(not(windows))]
+fn microphone_muted() -> bool {
     false
 }
 

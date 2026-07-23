@@ -10,14 +10,24 @@ use crate::models::{CaptureMode, DetectedMeeting, MeetingPlatform, RecorderState
 use crate::platform;
 use crate::state::AppState;
 
-/// How often to poll for in-progress meetings.
-const POLL_INTERVAL: Duration = Duration::from_secs(4);
+/// How often to poll for in-progress meetings. Kept short so a meeting is picked
+/// up (and auto-recording starts) within a couple of seconds of it opening.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Consecutive absent polls before a detected meeting is treated as really ended
-/// and its auto-recording is stopped. Debounces transient detection drops (e.g.
-/// briefly switching browser tabs away from a Google Meet call) so a recording
-/// isn't cut short. At `POLL_INTERVAL` (4s) this is ~8s.
-const END_GRACE_TICKS: u32 = 2;
+/// and its auto-recording is stopped. This MUST be generous: during a live meeting
+/// the title-based detector only *intermittently* matches — the pre-join and
+/// compact-view titles carry a "meeting"/"call" token, but the in-call window
+/// title frequently does not, and screen share / view switches drop it too. The
+/// meeting only stays "recorded" because those intermittent matches keep resetting
+/// this counter, so the grace has to be long enough to bridge the gaps between
+/// them. A short grace stopped recordings mid-call (observed: real Teams meetings
+/// auto-stopping after ~30-50s). The classifier no longer matches finished-meeting
+/// states (the Google Meet home / "you left" screen, the Teams "Calls" tab), so a
+/// genuinely ended meeting still stays absent for the full grace and auto-stops.
+/// At `POLL_INTERVAL` (2s) this is ~92s — the value proven to ride out in-meeting
+/// title churn while still ending a finished meeting within a minute and a half.
+const END_GRACE_TICKS: u32 = 46;
 
 fn key(platform: MeetingPlatform) -> String {
     format!("det_{platform:?}")
@@ -40,14 +50,35 @@ pub fn spawn(app: AppHandle, state: AppState) {
 }
 
 fn tick(app: &AppHandle, state: &AppState, missing_ticks: &mut u32) {
-    let mode = state.status.read().mode;
+    let (mode, auto_record) = {
+        let st = state.status.read();
+        let s = state.settings.read();
+        (st.mode, s.auto_record_detected)
+    };
 
-    // When the note taker is off, surface no detections.
-    if mode == CaptureMode::Off {
+    // Detection is active when the note taker is armed (any non-Off mode) OR when
+    // "Auto-record detected meetings" is enabled. This is the key: a user who left
+    // the mode on Off but turned auto-record on still gets meetings detected and
+    // captured — previously the Off gate blocked detection before auto-record was
+    // ever considered, so the toggle did nothing.
+    if mode == CaptureMode::Off && !auto_record {
         *missing_ticks = 0;
         clear_all(app, state);
+        // Fully off → the pill should read "Idle" (unless a manual capture is still
+        // finishing up).
+        set_baseline_state(app, state, RecorderState::Idle);
         return;
     }
+
+    // The mode a detected meeting is captured with. When the note taker is Off but
+    // auto-record is on, fall back to Record (the standard capturing mode, and the
+    // only one currently available in the UI) — mirroring how "Record Live" forces
+    // Record when the mode is Off.
+    let capture_mode = if mode == CaptureMode::Off {
+        CaptureMode::Record
+    } else {
+        mode
+    };
 
     let candidates = platform::detect::scan();
     let current: HashSet<String> = candidates.iter().map(|c| key(c.platform)).collect();
@@ -70,7 +101,9 @@ fn tick(app: &AppHandle, state: &AppState, missing_ticks: &mut u32) {
 
         {
             let mut st = state.status.write();
-            if st.state == RecorderState::Armed {
+            // Reflect detection in the UI whether the recorder was armed (non-Off
+            // mode) or idle (Off mode with auto-record on).
+            if st.state == RecorderState::Armed || st.state == RecorderState::Idle {
                 st.state = RecorderState::Detecting;
                 Events::status(app, &st);
             }
@@ -78,14 +111,13 @@ fn tick(app: &AppHandle, state: &AppState, missing_ticks: &mut u32) {
         Events::detected(app, &det);
 
         // Auto-record if enabled and nothing else is capturing.
-        let auto = state.settings.read().auto_record_detected;
-        if auto && state.session.lock().is_none() {
+        if auto_record && state.session.lock().is_none() {
             if let Err(e) = recorder::start(
                 app,
                 state,
                 det.title.clone(),
                 det.platform,
-                mode,
+                capture_mode,
                 Some(k.clone()),
             ) {
                 tracing::warn!("auto-record failed: {e}");
@@ -108,6 +140,38 @@ fn tick(app: &AppHandle, state: &AppState, missing_ticks: &mut u32) {
 
     // Auto-stop the recording once its source meeting has ended.
     maybe_auto_stop(app, state, &current, missing_ticks);
+
+    // Keep the status pill honest: while the note taker is active (armed mode or
+    // auto-record on) and nothing is currently being captured, show "Armed" (it's
+    // actively watching for meetings) rather than the misleading "Idle". A live
+    // detection shows "Meeting detected"; capture/processing states are left alone.
+    let baseline = if state.detected.read().is_empty() {
+        RecorderState::Armed
+    } else {
+        RecorderState::Detecting
+    };
+    set_baseline_state(app, state, baseline);
+}
+
+/// Move the recorder to a non-capturing baseline state (`Idle`, `Armed`, or
+/// `Detecting`) without disturbing an active capture. Recording/Processing/Error
+/// are owned by the recorder itself, so they're never overridden here; nor is a
+/// state that already matches. Emits a status event only when something changed.
+fn set_baseline_state(app: &AppHandle, state: &AppState, desired: RecorderState) {
+    // Never touch the state while a capture session is live — the recorder owns
+    // Recording/Processing transitions.
+    if state.session.lock().is_some() {
+        return;
+    }
+    let mut st = state.status.write();
+    match st.state {
+        RecorderState::Recording | RecorderState::Processing | RecorderState::Error => return,
+        _ if st.state == desired => return,
+        _ => {
+            st.state = desired;
+            Events::status(app, &st);
+        }
+    }
 }
 
 /// Stop the recording that was auto-started for a detected meeting once that

@@ -38,6 +38,15 @@ export const api = {
   setInputGain: (gain: number) =>
     invoke<RecorderStatus>("set_input_gain", { gain }),
 
+  /**
+   * Mute/unmute the microphone for the recording. Use this when you mute yourself
+   * inside a meeting app (Teams/Zoom/Meet) — those in-app mutes can't be detected
+   * automatically, so this stops your mic from being recorded. System audio keeps
+   * recording. Takes effect within a quarter-second.
+   */
+  setMicMute: (muted: boolean) =>
+    invoke<RecorderStatus>("set_mic_mute", { muted }),
+
   captureDetected: (id: string) =>
     invoke<RecorderStatus>("capture_detected", { id }),
   dismissDetected: (id: string) => invoke<void>("dismiss_detected", { id }),

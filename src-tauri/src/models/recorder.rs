@@ -35,6 +35,11 @@ pub struct RecorderStatus {
     pub elapsed_sec: u64,
     pub mic_level: f32,
     pub system_level: f32,
+    /// `true` while the user has the microphone muted (OS/device-level mute). The
+    /// mic is not recorded while set — only system audio is — and the mic level
+    /// meter reads 0. Lets the UI show a "mic muted" indicator.
+    #[serde(default)]
+    pub mic_muted: bool,
     /// Capture volume multiplier the pipeline applies to recorded audio. `1.0` is
     /// unity; the default is a mild boost. Adjustable live via the volume control.
     #[serde(default = "default_gain")]
@@ -57,6 +62,7 @@ impl Default for RecorderStatus {
             elapsed_sec: 0,
             mic_level: 0.0,
             system_level: 0.0,
+            mic_muted: false,
             input_gain: DEFAULT_INPUT_GAIN,
             audio_ready: false,
             message: None,

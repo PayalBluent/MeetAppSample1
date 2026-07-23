@@ -50,7 +50,7 @@ export function SettingsPage() {
                   key={mode}
                   mode={mode}
                   active={settings.defaultMode === mode}
-                  disabled={mode === "transcribe"}
+                  disabled={mode === "transcribe" || mode === "recordVideo"}
                   onClick={() => set({ defaultMode: mode })}
                 />
               ))}
@@ -361,9 +361,7 @@ function ModeChip({
     <button
       onClick={onClick}
       disabled={disabled}
-      title={
-        disabled ? "Transcription isn't working right now." : undefined
-      }
+      title={disabled ? `${meta.label} isn't available right now.` : undefined}
       className={cn(
         "no-drag flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
         active

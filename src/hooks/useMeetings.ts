@@ -106,6 +106,24 @@ export function useSetInputGain() {
   });
 }
 
+export function useSetMicMute() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (muted: boolean) => api.setMicMute(muted),
+    // Optimistic: flip the mic-muted state immediately so the button feels
+    // instant, then reconcile with the server (which also folds in OS mute).
+    onMutate: (muted) => {
+      const prev = qc.getQueryData<RecorderStatus>(qk.recorderStatus);
+      if (prev) qc.setQueryData(qk.recorderStatus, { ...prev, micMuted: muted });
+      return { prev };
+    },
+    onError: (_e, _muted, ctx) => {
+      if (ctx?.prev) qc.setQueryData(qk.recorderStatus, ctx.prev);
+    },
+    onSuccess: (status) => qc.setQueryData(qk.recorderStatus, status),
+  });
+}
+
 export function useCaptureDetected() {
   const qc = useQueryClient();
   return useMutation({

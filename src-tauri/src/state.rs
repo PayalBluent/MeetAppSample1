@@ -25,6 +25,12 @@ pub struct Inner {
     /// pipeline. Adjusting it via `set_input_gain` takes effect mid-recording
     /// because the pipeline reads this every buffer.
     pub recording_gain: Arc<AtomicU32>,
+    /// User's in-app microphone mute, toggled via `set_mic_mute`. Combined with the
+    /// OS/device mic mute by the recorder loop (either one silences the mic), so a
+    /// user muted inside a meeting app — which never touches the Windows endpoint —
+    /// can still stop their mic from being recorded. Reset to unmuted at each
+    /// recording start.
+    pub manual_mic_mute: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub type AppState = Arc<Inner>;
@@ -45,6 +51,7 @@ impl Inner {
             status: RwLock::new(RecorderStatus::default()),
             session: Mutex::new(None),
             recording_gain: Arc::new(AtomicU32::new(DEFAULT_INPUT_GAIN.to_bits())),
+            manual_mic_mute: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -53,6 +60,26 @@ impl Inner {
         let mut list: Vec<Meeting> = self.meetings.read().values().cloned().collect();
         list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         list
+    }
+
+    /// Persist a meeting's metadata to disk so it survives an app restart. A no-op
+    /// for meetings without a media file (e.g. demo seeds). Best-effort: any IO
+    /// failure is logged inside the library, never surfaced, so persistence can
+    /// never break a recording or a UI action.
+    pub fn persist_meeting(&self, m: &Meeting) {
+        let dir = self.settings.read().save_directory.clone();
+        crate::core::library::save(std::path::Path::new(&dir), m);
+    }
+
+    /// Load every recording persisted in `recordings_dir` (and import any media
+    /// file that has no sidecar yet) into the in-memory store. Called once at
+    /// startup so past recordings are visible. Demo seeds already present keep their
+    /// slots; loaded recordings have distinct ids and are merged in.
+    pub fn load_persisted_recordings(&self, recordings_dir: &std::path::Path) {
+        let mut meetings = self.meetings.write();
+        for m in crate::core::library::load_all(recordings_dir) {
+            meetings.insert(m.id.clone(), m);
+        }
     }
 }
 

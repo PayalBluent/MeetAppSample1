@@ -26,9 +26,9 @@ export function ModeSelector({
         const meta = MODE_META[mode];
         const active = value === mode;
         const isOff = mode === "off";
-        // Transcription isn't working yet — keep the option visible but
-        // unselectable so the user can't switch into a broken mode.
-        const unavailable = mode === "transcribe";
+        // These modes aren't available yet — keep them visible but unselectable
+        // so the user can't switch into a mode that isn't working.
+        const unavailable = mode === "transcribe" || mode === "recordVideo";
         return (
           <button
             key={mode}
@@ -39,7 +39,7 @@ export function ModeSelector({
             onClick={() => onChange(mode)}
             title={
               unavailable
-                ? "Transcription isn't working right now."
+                ? `${meta.label} isn't available right now.`
                 : meta.description
             }
             className={cn(

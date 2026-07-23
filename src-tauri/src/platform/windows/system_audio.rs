@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use windows::core::{implement, Interface, IUnknown, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
-    eCapture, eCommunications, eConsole, eRender, ActivateAudioInterfaceAsync,
+    eCapture, eCommunications, eConsole, eRender, ERole, ActivateAudioInterfaceAsync,
     IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
     IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -71,12 +71,47 @@ pub fn start(tx: Sender<AudioPacket>, stop: Arc<AtomicBool>) -> Option<(JoinHand
 /// `None` if it can't be determined. This only matters on the endpoint-loopback
 /// fallback: process loopback taps *upstream* of the endpoint mixer, so it keeps
 /// capturing regardless of mute. Read-only — it never changes the mute state.
+///
+/// Queries the **communications** render device first, then the **console**
+/// default — matching the endpoint-loopback fallback's device preference, so the
+/// mute we report is the mute of the endpoint we're actually capturing rather than
+/// a different default device.
 pub fn default_render_muted() -> Option<bool> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eRender, eCommunications)
+            .or_else(|_| enumerator.GetDefaultAudioEndpoint(eRender, eConsole))
+            .ok()?;
+        let vol: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
+        vol.GetMute().ok().map(|b| b.as_bool())
+    }
+}
+
+/// Whether the default **capture** endpoint (the microphone) is muted right now.
+/// `None` if it can't be determined. Mirrors [`default_render_muted`] for the input
+/// side: it reports the OS/hardware mic mute — the Windows Sound-settings input
+/// mute, a headset's mute switch, or a keyboard mic-mute key, all of which toggle
+/// this endpoint mute. Used to stop recording the microphone while the user has it
+/// muted (system audio keeps recording). We query the **communications** capture
+/// device first — the one the mic capture opens (see [`setup_capture_endpoint`]) —
+/// then the console default, so the mute we read is the mute of the device we're
+/// actually recording. Read-only — it never changes the mute state.
+///
+/// Note: this detects an OS/device-level mute only. Muting yourself *inside* a
+/// meeting app (the Teams/Zoom mute button) does not mute the Windows endpoint and
+/// is not exposed by any public API, so it cannot be detected here.
+pub fn default_capture_muted() -> Option<bool> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eCapture, eCommunications)
+            .or_else(|_| enumerator.GetDefaultAudioEndpoint(eCapture, eConsole))
+            .ok()?;
         let vol: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
         vol.GetMute().ok().map(|b| b.as_bool())
     }
@@ -220,26 +255,45 @@ fn run(
     Ok(())
 }
 
-/// Open (but don't start) a capture stream for `kind`. For system audio this
-/// prefers process loopback — device-independent and immune to the endpoint's
-/// mute/volume because it taps upstream of the endpoint mixer — and only falls
-/// back to classic endpoint loopback (bound to one device, mute-sensitive) when
-/// process loopback can't activate (older Windows, or an activation error).
+/// Open (but don't start) a capture stream for `kind`.
+///
+/// For system audio we prefer **process loopback** (`exclude-self`): it taps every
+/// other process's render stream *upstream of the endpoint mixer*, so it captures
+/// the meeting no matter which output device the audio is routed to, keeps recording
+/// even when the endpoint is muted, and never records our own sounds. Classic
+/// **endpoint (device) loopback** is the fallback for when process loopback can't
+/// activate (older Windows / an activation error): it records only the mix of one
+/// specific render endpoint. On that fallback we try the **communications** default
+/// render device first (where native conferencing apps route call audio), then the
+/// **console** default. The supervisor re-runs this selection on a device change.
 unsafe fn open_stream(kind: StreamKind) -> Result<CaptureStream, Box<dyn std::error::Error>> {
     match kind {
-        StreamKind::System => match setup_process_loopback() {
-            Ok(s) => {
-                tracing::info!("system audio: WASAPI process loopback (exclude-self)");
-                Ok(s)
+        StreamKind::System => {
+            match setup_process_loopback() {
+                Ok(s) => {
+                    tracing::info!("system audio: WASAPI process loopback (exclude-self)");
+                    return Ok(s);
+                }
+                Err(e) => tracing::warn!(
+                    "system audio: process loopback unavailable ({e}); falling back to \
+                     endpoint loopback (device-bound, mute-sensitive)"
+                ),
             }
-            Err(e) => {
-                tracing::warn!(
-                    "system audio: process loopback unavailable ({e}); \
-                     falling back to endpoint loopback (device-bound, mute-sensitive)"
-                );
-                setup_endpoint_loopback()
+            match setup_endpoint_loopback(eCommunications) {
+                Ok(s) => {
+                    tracing::info!(
+                        "system audio: endpoint loopback (communications render device)"
+                    );
+                    return Ok(s);
+                }
+                Err(e) => tracing::warn!(
+                    "system audio: communications-endpoint loopback unavailable ({e}); trying console endpoint"
+                ),
             }
-        },
+            let s = setup_endpoint_loopback(eConsole)?;
+            tracing::info!("system audio: endpoint loopback (console render device)");
+            Ok(s)
+        }
         StreamKind::Microphone => {
             tracing::info!("microphone: WASAPI capture endpoint");
             setup_capture_endpoint()
@@ -586,11 +640,11 @@ unsafe fn setup_process_loopback() -> Result<CaptureStream, Box<dyn std::error::
 
 // ------------------------------------------------------------ endpoint loopback
 
-unsafe fn setup_endpoint_loopback() -> Result<CaptureStream, Box<dyn std::error::Error>> {
+unsafe fn setup_endpoint_loopback(role: ERole) -> Result<CaptureStream, Box<dyn std::error::Error>> {
     let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
         .map_err(|e| format!("CoCreateInstance: {e}"))?;
     let device: IMMDevice = enumerator
-        .GetDefaultAudioEndpoint(eRender, eConsole)
+        .GetDefaultAudioEndpoint(eRender, role)
         .map_err(|e| format!("GetDefaultAudioEndpoint: {e}"))?;
     let client: IAudioClient = device
         .Activate(CLSCTX_ALL, None)

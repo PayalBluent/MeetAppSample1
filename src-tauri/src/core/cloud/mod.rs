@@ -90,6 +90,7 @@ pub fn run_transcription(
                 }
                 m.clone()
             };
+            state.persist_meeting(&updated);
             Events::updated(app, &updated);
             Ok(updated)
         }
@@ -141,6 +142,7 @@ pub fn run_summarization(app: &AppHandle, state: &AppState, meeting_id: &str) ->
         m.status = MeetingStatus::Ready;
         m.clone()
     };
+    state.persist_meeting(&updated);
     Events::updated(app, &updated);
     Ok(updated)
 }

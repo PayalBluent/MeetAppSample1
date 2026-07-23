@@ -138,6 +138,30 @@ pub fn set_input_gain(app: AppHandle, state: State<'_, AppState>, gain: f32) -> 
     snapshot
 }
 
+/// Mute or unmute the microphone for the recording from within the app. This is
+/// the reliable way to stop recording your mic when you mute yourself *inside* a
+/// meeting app (Teams/Zoom/Meet): those in-app mutes don't touch the Windows
+/// microphone endpoint, so they can't be detected automatically — this manual
+/// toggle gates the mic regardless. Combined with the OS/device mute by the
+/// recorder loop (either one silences the mic); system audio keeps recording.
+/// Takes effect within a quarter-second. Returns the updated status.
+#[tauri::command]
+pub fn set_mic_mute(app: AppHandle, state: State<'_, AppState>, muted: bool) -> RecorderStatus {
+    state
+        .manual_mic_mute
+        .store(muted, std::sync::atomic::Ordering::Relaxed);
+    let snapshot = {
+        let mut st = state.status.write();
+        // Optimistic: reflect the toggle immediately. The recorder loop reconciles
+        // this with the OS mute within a tick (so unmuting here still shows muted if
+        // the device itself is muted).
+        st.mic_muted = muted;
+        st.clone()
+    };
+    Events::status(&app, &snapshot);
+    snapshot
+}
+
 #[tauri::command]
 pub fn stop_capture(app: AppHandle, state: State<'_, AppState>) -> AppResult<Option<Meeting>> {
     match recorder::stop(&app, state.inner()) {
@@ -211,6 +235,7 @@ pub fn toggle_meeting_flag(
         m.clone()
     };
     Events::updated(&app, &meeting);
+    state.persist_meeting(&meeting);
     Ok(meeting)
 }
 
@@ -230,6 +255,7 @@ pub fn rename_meeting(
         m.clone()
     };
     Events::updated(&app, &meeting);
+    state.persist_meeting(&meeting);
     Ok(meeting)
 }
 
@@ -254,12 +280,20 @@ pub fn update_action_item(
         m.clone()
     };
     Events::updated(&app, &meeting);
+    state.persist_meeting(&meeting);
     Ok(meeting)
 }
 
+/// Explicitly delete a meeting: removes it from the list **and** deletes its media
+/// files and metadata sidecar from disk. This is the only path that removes a
+/// recording — recordings are otherwise kept indefinitely and reloaded on restart.
 #[tauri::command]
 pub fn delete_meeting(state: State<'_, AppState>, id: String) {
-    state.meetings.write().remove(&id);
+    let removed = state.meetings.write().remove(&id);
+    if let Some(m) = removed {
+        let dir = state.settings.read().save_directory.clone();
+        crate::core::library::delete(std::path::Path::new(&dir), &m);
+    }
 }
 
 /// On-demand transcription via AssemblyAI. Runs off the async runtime so the UI

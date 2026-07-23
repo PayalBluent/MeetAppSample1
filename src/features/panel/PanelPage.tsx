@@ -10,6 +10,7 @@ import {
   Loader2,
   LogOut,
   Mic,
+  MicOff,
   Minus,
   Plus,
   Settings as SettingsIcon,
@@ -43,6 +44,7 @@ import {
   useStartCapture,
   useStopCapture,
   useSetInputGain,
+  useSetMicMute,
   useCaptureDetected,
   useDismissDetected,
 } from "@/hooks/useMeetings";
@@ -61,6 +63,7 @@ export function PanelPage() {
   const startCapture = useStartCapture();
   const stopCapture = useStopCapture();
   const setInputGain = useSetInputGain();
+  const setMicMute = useSetMicMute();
   const captureDetected = useCaptureDetected();
   const dismissDetected = useDismissDetected();
 
@@ -71,6 +74,7 @@ export function PanelPage() {
   // the first audio arrives we show a "starting…" state instead of live meters.
   const audioReady = status?.audioReady ?? false;
   const inputGain = status?.inputGain ?? 1.5;
+  const micMuted = status?.micMuted ?? false;
 
   const openMeetings = async () => {
     const shown = await showMainWindow();
@@ -206,11 +210,38 @@ export function PanelPage() {
                       </div>
                       {audioReady ? (
                         <div className="mt-3 space-y-2">
-                          <MeterRow
-                            label="Mic"
-                            level={status.micLevel}
-                            tone="destructive"
-                          />
+                          <div className="flex items-center gap-2">
+                            <QuickTip
+                              label={
+                                micMuted
+                                  ? "Unmute — record your microphone again"
+                                  : "Mute your mic — stops recording your voice (e.g. when you mute in the meeting app). System audio keeps recording."
+                              }
+                            >
+                              <button
+                                onClick={() => setMicMute.mutate(!micMuted)}
+                                className={cn(
+                                  "no-drag grid size-6 shrink-0 place-items-center rounded-md border transition-colors",
+                                  micMuted
+                                    ? "border-destructive/50 bg-destructive/10 text-destructive"
+                                    : "border-border text-muted-foreground hover:text-foreground",
+                                )}
+                              >
+                                {micMuted ? (
+                                  <MicOff className="size-3.5" />
+                                ) : (
+                                  <Mic className="size-3.5" />
+                                )}
+                              </button>
+                            </QuickTip>
+                            <div className="flex-1">
+                              <MeterRow
+                                label={micMuted ? "Muted" : "Mic"}
+                                level={micMuted ? 0 : status.micLevel}
+                                tone="destructive"
+                              />
+                            </div>
+                          </div>
                           {status.mode !== "transcribe" && (
                             <MeterRow label="System" level={status.systemLevel} />
                           )}

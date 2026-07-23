@@ -152,6 +152,11 @@ export interface RecorderStatus {
   micLevel: number;
   systemLevel: number;
   /**
+   * `true` while the microphone is muted (either the OS/device mute or the in-app
+   * mute toggle). The mic isn't recorded while muted — only system audio is.
+   */
+  micMuted: boolean;
+  /**
    * Capture volume multiplier applied to recorded audio. `1.0` is unity; the
    * default is a mild boost. Adjustable live via the volume control.
    */

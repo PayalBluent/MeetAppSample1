@@ -83,6 +83,10 @@ pub struct Recorder {
     /// mute-sensitive) rather than the mute-immune process-loopback path. When set,
     /// the recorder watches the output-device mute state and warns on mute.
     system_endpoint_fallback: bool,
+    /// Set by the recorder loop while the user has the microphone muted. The
+    /// pipeline reads it every buffer: the mic channel is recorded as silence and
+    /// opens no speaker segment, while the system channel keeps recording.
+    mic_muted: Arc<AtomicBool>,
 }
 
 impl Recorder {
@@ -95,6 +99,7 @@ impl Recorder {
         let sys_level = Arc::new(AtomicU32::new(0));
         let segments = Arc::new(Mutex::new(Vec::new()));
         let audio_ready = Arc::new(AtomicBool::new(false));
+        let mic_muted = Arc::new(AtomicBool::new(false));
 
         let (tx, rx) = mpsc::channel::<AudioPacket>();
         let start = Instant::now();
@@ -129,6 +134,7 @@ impl Recorder {
             segments.clone(),
             audio_ready.clone(),
             gain,
+            mic_muted.clone(),
         );
         let pipeline_join = match pipeline_join {
             Some(h) => Some(h),
@@ -162,6 +168,7 @@ impl Recorder {
             audio_ready,
             mic_exclusive,
             system_endpoint_fallback,
+            mic_muted,
         })
     }
 
@@ -175,6 +182,19 @@ impl Recorder {
     /// endpoint makes this path record silence); process loopback is immune.
     pub fn system_on_endpoint_fallback(&self) -> bool {
         self.system_endpoint_fallback
+    }
+
+    /// Set whether the user currently has the microphone muted. The pipeline reads
+    /// this every buffer, so it takes effect within one buffer: the mic channel is
+    /// recorded as silence (and opens no speaker segment) while set, and the system
+    /// channel keeps recording. Called from the recorder loop's mute watcher.
+    pub fn set_mic_muted(&self, muted: bool) {
+        self.mic_muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// Whether the microphone is currently muted (as last observed by the loop).
+    pub fn mic_muted(&self) -> bool {
+        self.mic_muted.load(Ordering::Relaxed)
     }
 
     /// Whether capture is live yet — `true` once the first audio packet has been
@@ -317,11 +337,20 @@ pub fn clean_wav_file(path: &Path, cancel_system: bool, cancel_mic: bool) -> App
         // is safe and effective); leave the far-end ungated — it may be music or
         // several remote speakers that a single-speaker gate would damage.
         let system = maybe_denoise(resample_to(&system, spec.sample_rate, 48_000), cancel_system, false);
-        let mic = maybe_denoise(resample_to(&mic, spec.sample_rate, 48_000), cancel_mic, true);
+        // High-pass the mic (~80 Hz) before suppression to strip low-frequency room
+        // rumble, desk/handling thumps, and AC-hum fundamentals that RNNoise leaves
+        // behind and the later loudness boost would otherwise amplify. Voice
+        // fundamentals sit above this, so speech is untouched. Mic side only — the
+        // far end may carry legitimate bass (music, etc.).
+        let mic48 = resample_to(&mic, spec.sample_rate, 48_000);
+        let mic48 = if cancel_mic { high_pass(&mic48, 48_000, 80.0) } else { mic48 };
+        let mic = maybe_denoise(mic48, cancel_mic, true);
         let n = system.len().min(mic.len());
         (0..n).map(|i| (system[i] + mic[i]) * 0.5).collect()
     } else {
-        maybe_denoise(resample_to(&samples, spec.sample_rate, 48_000), true, true)
+        // A single mixed/mono track: high-pass then suppress as the mic path.
+        let mono = high_pass(&resample_to(&samples, spec.sample_rate, 48_000), 48_000, 80.0);
+        maybe_denoise(mono, true, true)
     };
     if mono48.is_empty() {
         return Ok(());
@@ -438,6 +467,91 @@ pub fn normalize_wav_file(path: &Path) -> AppResult<()> {
         writer
             .write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
             .map_err(|e| AppError::Audio(e.to_string()))?;
+    }
+    writer.finalize().map_err(|e| AppError::Audio(e.to_string()))?;
+    Ok(())
+}
+
+/// Trim leading and trailing dead air from a recorded WAV **in place**.
+///
+/// Only the silent run at the very start and very end is removed — interior gaps
+/// (natural pauses, or stretches where the mic was muted while system audio kept
+/// playing) are preserved, so the recording stays in sync with its transcript
+/// timestamps. Silence is judged on the **combined** signal (the loudest channel at
+/// each frame): a frame is dead air only when *every* channel is below the
+/// threshold, so system audio during a mic-muted stretch counts as content and is
+/// kept. A short pad is left on each side so speech onsets/tails aren't clipped, and
+/// an all-silent file is left untouched rather than emptied.
+///
+/// Run this on the pre-enhancement signal (before [`normalize_wav_file`]) so
+/// silence is measured before the AGC boost lifts the noise floor.
+pub fn trim_silence_wav_file(path: &Path) -> AppResult<()> {
+    /// Peak amplitude at/above which a frame counts as content (~ -46 dBFS).
+    const THRESHOLD: f32 = 0.005;
+    /// Lead-in / lead-out kept around detected content so nothing is clipped.
+    const PAD_MS: u64 = 200;
+
+    let reader = hound::WavReader::open(path).map_err(|e| AppError::Audio(e.to_string()))?;
+    let spec = reader.spec();
+    let channels = spec.channels.max(1) as usize;
+
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => {
+            reader.into_samples::<f32>().filter_map(Result::ok).collect()
+        }
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .into_samples::<i32>()
+                .filter_map(Result::ok)
+                .map(|s| (s as f32 / max).clamp(-1.0, 1.0))
+                .collect()
+        }
+    };
+    let total_frames = samples.len() / channels;
+    if total_frames == 0 {
+        return Ok(());
+    }
+
+    // Per-frame amplitude = the loudest channel at that frame, so content on *any*
+    // channel (e.g. system audio while the mic is muted) keeps the frame.
+    let amp = |frame: usize| -> f32 {
+        let base = frame * channels;
+        samples[base..base + channels]
+            .iter()
+            .fold(0.0f32, |m, &s| m.max(s.abs()))
+    };
+
+    let first = (0..total_frames).find(|&f| amp(f) >= THRESHOLD);
+    let last = (0..total_frames).rev().find(|&f| amp(f) >= THRESHOLD);
+    let (Some(first), Some(last)) = (first, last) else {
+        // Entirely silent — leave the file as-is rather than producing an empty one.
+        return Ok(());
+    };
+
+    let pad = (PAD_MS * spec.sample_rate as u64 / 1000) as usize;
+    let start = first.saturating_sub(pad);
+    let end = (last + pad).min(total_frames - 1); // inclusive
+    if start == 0 && end == total_frames - 1 {
+        return Ok(()); // no dead air at either edge — nothing to trim
+    }
+
+    let out_spec = hound::WavSpec {
+        channels: spec.channels,
+        sample_rate: spec.sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer =
+        hound::WavWriter::create(path, out_spec).map_err(|e| AppError::Audio(e.to_string()))?;
+    for f in start..=end {
+        let base = f * channels;
+        for c in 0..channels {
+            let pcm = (samples[base + c].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            writer
+                .write_sample(pcm)
+                .map_err(|e| AppError::Audio(e.to_string()))?;
+        }
     }
     writer.finalize().map_err(|e| AppError::Audio(e.to_string()))?;
     Ok(())
@@ -616,6 +730,211 @@ mod normalize_tests {
         let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
         (peak, rms)
     }
+}
+
+#[cfg(test)]
+mod hpf_tests {
+    use super::*;
+    use std::f32::consts::PI;
+
+    fn tone(freq: f32, fs: u32) -> Vec<f32> {
+        (0..fs)
+            .map(|i| (i as f32 * 2.0 * PI * freq / fs as f32).sin() * 0.5)
+            .collect()
+    }
+    fn rms(s: &[f32]) -> f32 {
+        (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt()
+    }
+
+    /// An 80 Hz high-pass strongly attenuates low-frequency noise (rumble/hum) but
+    /// leaves the speech band essentially intact — so it cleans the mic without
+    /// dulling the voice.
+    #[test]
+    fn high_pass_kills_rumble_keeps_speech() {
+        let fs = 48_000u32;
+        let low = high_pass(&tone(40.0, fs), fs, 80.0); // sub-bass rumble
+        let hum = high_pass(&tone(60.0, fs), fs, 80.0); // mains hum fundamental
+        let speech = high_pass(&tone(300.0, fs), fs, 80.0); // mid speech band
+
+        // Measure the steady-state tail to skip the filter's startup transient.
+        let tail = |s: &[f32]| s[fs as usize / 2..].to_vec();
+        let ref40 = rms(&tail(&tone(40.0, fs)));
+        let ref300 = rms(&tail(&tone(300.0, fs)));
+
+        assert!(rms(&tail(&low)) / ref40 < 0.4, "40 Hz rumble must be cut hard");
+        assert!(rms(&tail(&hum)) / ref40 < 0.7, "60 Hz hum must be attenuated");
+        assert!(
+            rms(&tail(&speech)) / ref300 > 0.85,
+            "300 Hz speech band must be preserved"
+        );
+    }
+
+    #[test]
+    fn high_pass_is_noop_on_empty_or_bad_args() {
+        assert!(high_pass(&[], 48_000, 80.0).is_empty());
+        let s = tone(300.0, 8_000);
+        assert_eq!(high_pass(&s, 0, 80.0).len(), s.len());
+        assert_eq!(high_pass(&s, 48_000, 0.0).len(), s.len());
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    /// Write a mono 48 kHz WAV from `(frames, amplitude)` sections; amplitude 0.0
+    /// is silence, otherwise a tone at that peak.
+    fn write_mono(path: &Path, sections: &[(usize, f32)]) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        let mut n = 0usize;
+        for &(frames, amp) in sections {
+            for _ in 0..frames {
+                let s = if amp > 0.0 { (n as f32 * 0.05).sin() * amp } else { 0.0 };
+                w.write_sample((s * i16::MAX as f32) as i16).unwrap();
+                n += 1;
+            }
+        }
+        w.finalize().unwrap();
+    }
+
+    fn frame_count(path: &Path) -> usize {
+        let r = hound::WavReader::open(path).unwrap();
+        r.len() as usize / r.spec().channels.max(1) as usize
+    }
+
+    fn peak(path: &Path) -> u16 {
+        hound::WavReader::open(path)
+            .unwrap()
+            .into_samples::<i16>()
+            .filter_map(Result::ok)
+            .map(|s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Leading and trailing silence is removed, the spoken content and a small pad
+    /// are kept, and the file gets meaningfully shorter.
+    #[test]
+    fn trims_leading_and_trailing_silence() {
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("trim-lead-trail.wav");
+        let _ = std::fs::remove_file(&path);
+        // 1s silence | 1s tone | 1s silence.
+        write_mono(&path, &[(48_000, 0.0), (48_000, 0.5), (48_000, 0.0)]);
+        assert_eq!(frame_count(&path), 144_000);
+
+        trim_silence_wav_file(&path).expect("trim should succeed");
+
+        let after = frame_count(&path);
+        assert!(after < 144_000, "should be trimmed shorter, got {after}");
+        // ≈ 1s tone + a 200ms pad on each side.
+        assert!((60_000..=68_000).contains(&after), "≈ tone + 2×0.2s pad, got {after}");
+        assert!(peak(&path) > 1000, "the spoken content must be preserved");
+    }
+
+    /// An entirely silent recording is left untouched, never emptied into a broken
+    /// zero-length file.
+    #[test]
+    fn keeps_all_silent_file_untouched() {
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("trim-all-silent.wav");
+        let _ = std::fs::remove_file(&path);
+        write_mono(&path, &[(48_000, 0.0)]);
+
+        trim_silence_wav_file(&path).expect("trim should succeed");
+
+        assert_eq!(frame_count(&path), 48_000, "silent file left as-is");
+    }
+
+    /// A recording with no dead air at either edge keeps its full length.
+    #[test]
+    fn noop_when_no_dead_air() {
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("trim-no-deadair.wav");
+        let _ = std::fs::remove_file(&path);
+        write_mono(&path, &[(48_000, 0.5)]);
+        let before = frame_count(&path);
+
+        trim_silence_wav_file(&path).expect("trim should succeed");
+
+        assert_eq!(frame_count(&path), before, "no dead air → unchanged length");
+    }
+
+    /// Frames where only the system (left) channel has audio while the mic (right)
+    /// is silent — a muted mic during active system audio — are content and must be
+    /// kept: nothing is trimmed.
+    #[test]
+    fn keeps_frames_where_only_system_has_audio() {
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("trim-muted-mic.wav");
+        let _ = std::fs::remove_file(&path);
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        {
+            let mut w = hound::WavWriter::create(&path, spec).unwrap();
+            for i in 0..48_000 {
+                let l = (i as f32 * 0.05).sin() * 0.5; // system audio
+                let r = 0.0f32; // muted mic
+                w.write_sample((l * i16::MAX as f32) as i16).unwrap();
+                w.write_sample((r * i16::MAX as f32) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let before = frame_count(&path);
+
+        trim_silence_wav_file(&path).expect("trim should succeed");
+
+        assert_eq!(frame_count(&path), before, "system-only content must be kept");
+    }
+}
+
+/// Second-order (biquad) high-pass filter over mono f32 samples, used to remove
+/// sub-`cutoff_hz` energy from the microphone: room rumble, desk/handling thumps,
+/// AC-hum fundamentals, and DC offset. Butterworth response (Q ≈ 0.707), RBJ
+/// cookbook coefficients, direct-form I. Returns a buffer the same length as the
+/// input; a no-op on empty input or a nonsensical rate/cutoff.
+fn high_pass(input: &[f32], sample_rate: u32, cutoff_hz: f32) -> Vec<f32> {
+    if input.is_empty() || sample_rate == 0 || cutoff_hz <= 0.0 {
+        return input.to_vec();
+    }
+    let fs = sample_rate as f32;
+    let q = std::f32::consts::FRAC_1_SQRT_2; // 0.707 — maximally flat (Butterworth)
+    let w0 = 2.0 * std::f32::consts::PI * cutoff_hz / fs;
+    let (sin_w0, cos_w0) = w0.sin_cos();
+    let alpha = sin_w0 / (2.0 * q);
+
+    let a0 = 1.0 + alpha;
+    let b0 = ((1.0 + cos_w0) / 2.0) / a0;
+    let b1 = (-(1.0 + cos_w0)) / a0;
+    let b2 = ((1.0 + cos_w0) / 2.0) / a0;
+    let a1 = (-2.0 * cos_w0) / a0;
+    let a2 = (1.0 - alpha) / a0;
+
+    let mut out = Vec::with_capacity(input.len());
+    let (mut x1, mut x2, mut y1, mut y2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for &x in input {
+        let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1;
+        x1 = x;
+        y2 = y1;
+        y1 = y;
+        out.push(y);
+    }
+    out
 }
 
 /// Whole-buffer linear resampler (offline use).
