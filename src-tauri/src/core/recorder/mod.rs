@@ -460,32 +460,33 @@ pub fn stop(app: &AppHandle, state: &AppState) -> AppResult<Meeting> {
     std::thread::Builder::new()
         .name("meetapp-finalize".into())
         .spawn(move || {
-            // Auto-correct the recording before it can be played: AI noise
-            // cancellation first, then loudness enhancement (AGC). This is why the
-            // UI holds the audio as "unavailable" until the meeting is Ready — the
-            // file the user hears is always the corrected one.
-            //
-            // Only for modes that KEEP audio (Record / RecordVideo). Transcribe
-            // mode writes a throwaway temp file it deletes right after making the
-            // transcript, so enhancing it would be wasted work and there is no
-            // audio to play back anyway.
+            // ── SINGLE noise-suppression decision point ──────────────────────
+            // DeepFilterNet is the primary engine; RNNoise is the fallback used
+            // only when DeepFilterNet is unavailable/fails/produces invalid output.
+            // Never both (see `audio::suppress_noise`). This runs for EVERY mode
+            // that produced audio — including Transcribe's temp file — so the very
+            // same processed audio is what we save for playback and/or send to
+            // transcription. `run_transcription` no longer denoises: this is the
+            // only suppression pass in the pipeline.
+            if let Some(path) = &audio_path {
+                // Toggles: "cancel my noise" → mic side, "cancel others' noise" →
+                // far-end side. Read here so a mid-session change still applies.
+                let (cancel_system, cancel_mic) = {
+                    let s = state2.settings.read();
+                    (s.cancel_others_noise, s.cancel_my_noise)
+                };
+                audio::suppress_noise(std::path::Path::new(path), cancel_system, cancel_mic);
+            }
+
+            // Loudness/dead-air correction for PLAYBACK — this is AGC + trimming,
+            // not noise suppression, so it stays scoped to modes that KEEP audio.
+            // Transcribe mode's throwaway temp doesn't need it (and there's nothing
+            // to play back).
             if mode.saves_audio() {
                 if let Some(path) = &audio_path {
-                    // Per-channel noise cancellation, driven by the two settings
-                    // toggles: "cancel my noise" → mic side, "cancel others' noise"
-                    // → system/far-end side. Read here so a mid-session change to
-                    // either toggle applies to the recording being finalized.
-                    let (cancel_system, cancel_mic) = {
-                        let s = state2.settings.read();
-                        (s.cancel_others_noise, s.cancel_my_noise)
-                    };
                     let p = std::path::Path::new(path);
-                    if let Err(e) = audio::clean_wav_file(p, cancel_system, cancel_mic) {
-                        tracing::warn!("noise cancellation failed: {e}");
-                    }
                     // Trim leading/trailing dead air before enhancing, so the AGC
-                    // boost is measured over real content and silence is judged
-                    // before the boost lifts the noise floor. Skipped for video: the
+                    // boost is measured over real content. Skipped for video: the
                     // A/V mux uses ffmpeg `-shortest`, so a shortened audio track
                     // would truncate the video.
                     if !mode.saves_video() {

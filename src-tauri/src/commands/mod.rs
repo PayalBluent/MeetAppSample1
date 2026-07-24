@@ -378,9 +378,10 @@ pub async fn enhance_meeting_audio(
     Ok(meeting)
 }
 
-/// Noise-cancel a saved recording on demand: runs AI noise suppression (RNNoise)
-/// over the WAV in place (see [`crate::audio::clean_wav_file`]). Runs off the
-/// async runtime. Refuses (with [`AUDIO_UNAVAILABLE`]) when audio isn't available.
+/// Noise-cancel a saved recording on demand: runs the single noise-suppression
+/// decision point (DeepFilterNet primary, RNNoise fallback — see
+/// [`crate::audio::suppress_noise`]) over the WAV in place. Runs off the async
+/// runtime. Refuses (with [`AUDIO_UNAVAILABLE`]) when audio isn't available.
 #[tauri::command]
 pub async fn clean_meeting_audio(
     app: AppHandle,
@@ -389,12 +390,12 @@ pub async fn clean_meeting_audio(
 ) -> AppResult<Meeting> {
     let (path, meeting) = require_available_audio(state.inner(), &id)?;
 
-    // Explicit on-demand action: clean both sides regardless of the toggles.
+    // Explicit on-demand action: suppress regardless of the toggles (pass both on).
     tauri::async_runtime::spawn_blocking(move || {
-        crate::audio::clean_wav_file(std::path::Path::new(&path), true, true)
+        crate::audio::suppress_noise(std::path::Path::new(&path), true, true);
     })
     .await
-    .map_err(|e| AppError::Other(format!("noise-cancellation task failed: {e}")))??;
+    .map_err(|e| AppError::Other(format!("noise-cancellation task failed: {e}")))?;
 
     Events::updated(&app, &meeting);
     Ok(meeting)

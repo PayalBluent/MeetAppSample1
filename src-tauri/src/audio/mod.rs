@@ -19,6 +19,7 @@
 
 mod apm;
 mod capture;
+pub mod deepfilter;
 pub mod denoise;
 mod pipeline;
 mod vad;
@@ -282,6 +283,51 @@ pub fn mux_audio_into_video(video_mp4: &str, audio_wav: &str) -> Option<String> 
     }
 }
 
+/// The **single** noise-suppression decision point for the whole app.
+///
+/// Priority (never both, never blended):
+/// ```text
+///   DeepFilterNet ──ok──▶ processed audio (RNNoise not run, not initialized)
+///        └──fail/unavailable──▶ RNNoise fallback ──▶ processed audio
+/// ```
+/// DeepFilterNet is the primary engine: it runs first and, when it succeeds, is
+/// the sole source of truth. RNNoise is a safety net used *only* when DeepFilterNet
+/// is unavailable (feature off / disabled), fails to run, or yields invalid output.
+///
+/// Operates **in place** on `path`, so the very same processed file is what gets
+/// saved for playback *and* sent to transcription — there is no second, separate
+/// suppression pass anywhere else in the pipeline.
+///
+/// The two settings toggles still gate whether we suppress at all: with both off
+/// the recording is left untouched (matching the prior behavior). When either is
+/// on, DeepFilterNet processes the whole file; the RNNoise fallback honors the
+/// per-channel toggles.
+pub fn suppress_noise(path: &Path, cancel_system: bool, cancel_mic: bool) {
+    if !cancel_system && !cancel_mic {
+        return; // user turned noise cancellation off entirely
+    }
+    match denoise_deepfilter(path) {
+        Ok(()) => {
+            tracing::info!("[Audio] DeepFilterNet initialized");
+            tracing::info!("[Audio] Using DeepFilterNet noise suppression");
+            tracing::info!("[Audio] RNNoise disabled");
+        }
+        Err(reason) => {
+            tracing::warn!("[Audio] DeepFilterNet failed: {reason}");
+            tracing::info!("[Audio] Switching to RNNoise fallback");
+            if let Err(e) = clean_wav_file(path, cancel_system, cancel_mic) {
+                tracing::warn!("[Audio] RNNoise fallback failed: {e}");
+            }
+        }
+    }
+}
+
+/// Thin indirection so `suppress_noise` reads cleanly; delegates to the
+/// DeepFilterNet module's in-place enhancer (subprocess, embedded model).
+fn denoise_deepfilter(path: &Path) -> Result<(), String> {
+    deepfilter::try_enhance_in_place(path)
+}
+
 /// Offline noise-clean a recorded WAV in place, honoring the two independent
 /// toggles. The recorder writes stereo **L = system ("others"), R = mic ("you")**,
 /// so cleaning is done *per channel*: `cancel_mic` runs RNNoise on the mic side
@@ -295,6 +341,9 @@ pub fn mux_audio_into_video(video_mp4: &str, audio_wav: &str) -> Option<String> 
 /// mono file). Never discards audio: if suppression yields nothing on a side, the
 /// raw side is kept. A mono input (e.g. re-cleaning an already-mixed file) can't
 /// be separated, so it's cleaned as a whole when either toggle is on.
+///
+/// Used as the **RNNoise fallback** inside [`suppress_noise`] and by the on-demand
+/// "clean" command; it is not a second automatic suppression stage.
 pub fn clean_wav_file(path: &Path, cancel_system: bool, cancel_mic: bool) -> AppResult<()> {
     if !cancel_system && !cancel_mic {
         return Ok(());
@@ -649,6 +698,27 @@ mod clean_tests {
 
         let spec = hound::WavReader::open(&path).unwrap().spec();
         assert_eq!(spec.channels, 2, "left untouched when both toggles are off");
+    }
+
+    /// In the DEFAULT build (DeepFilterNet feature not compiled), the single
+    /// decision point [`suppress_noise`] must fall back to RNNoise — which
+    /// collapses the stereo recording to cleaned 48 kHz mono. This proves the
+    /// fallback path is wired and actually runs RNNoise (not nothing). Gated to the
+    /// no-feature build so DeepFilterNet can never pre-empt it here.
+    #[cfg(not(feature = "deepfilter"))]
+    #[test]
+    fn suppress_noise_falls_back_to_rnnoise_in_default_build() {
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("suppress-fallback.wav");
+        let _ = std::fs::remove_file(&path);
+        write_stereo(&path, 48_000);
+
+        suppress_noise(&path, true, true); // DeepFilter unavailable → RNNoise
+
+        let spec = hound::WavReader::open(&path).unwrap().spec();
+        assert_eq!(spec.channels, 1, "RNNoise fallback mixes down to mono");
+        assert_eq!(spec.sample_rate, 48_000);
     }
 
     /// Per-channel cleaning collapses the stereo recording to a 48 kHz mono file

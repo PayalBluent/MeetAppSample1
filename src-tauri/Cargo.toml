@@ -125,6 +125,16 @@ screen-capture = ["dep:windows-capture"]
 # cloud AssemblyAI backend; needs a C/C++ toolchain + CMake).
 whisper = ["dep:whisper-rs"]
 
+# Optional DeepFilterNet noise-suppression *preprocessing* in front of the
+# AssemblyAI transcription pipeline. Off by default so the shipped build is
+# unchanged. Adds no Rust dependency: it shells out to the external DeepFilterNet
+# CLI (`deep-filter`), exactly like the optional ffmpeg A/V mux, and falls back to
+# the original audio whenever the tool is missing or fails. Build with:
+#   cargo build --features deepfilter   (needs the `deep-filter` CLI on PATH)
+# Runtime knobs: MEETAPP_DEEPFILTER (0/1), MEETAPP_DEEPFILTER_BIN,
+# MEETAPP_DEEPFILTER_ARGS. See `src/audio/deepfilter.rs`.
+deepfilter = []
+
 [profile.release]
 opt-level = "s"
 lto = true

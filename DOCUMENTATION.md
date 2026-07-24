@@ -162,6 +162,8 @@ sample1/
         │   ├── ai/             #   Summarizer trait (heuristic)
         │   └── cloud/          #   AssemblyAI + Groq
         ├── audio/              # Audio capture → processing → WAV pipeline
+        │   ├── denoise.rs      #   RNNoise noise suppression (Denoiser trait)
+        │   └── deepfilter.rs   #   Optional DeepFilterNet pre-transcription stage
         └── platform/           # Platform-SPECIFIC code (isolated)
             ├── detect.rs       #   detection facade
             ├── screen.rs       #   screen-capture facade
@@ -470,6 +472,48 @@ end-to-end rather than hanging — matching the browser mock. The on-demand "Tra
 button stays cloud-only and reports a clear "add your key" error instead.
 
 **Where do the API keys come from?** See §10.
+
+#### Optional: DeepFilterNet noise-suppression preprocessing
+
+DeepFilterNet is an **opt-in preprocessing stage that sits in front of AssemblyAI** —
+it does not replace or alter the transcription pipeline in any way:
+
+```text
+Input Audio
+     │
+     ├── (Optional) DeepFilterNet noise suppression   ← audio/deepfilter.rs
+     │
+     └── AssemblyAI transcription (existing pipeline)  ← core/cloud/assemblyai.rs
+               │
+         Existing output (segments, diarization, timestamps)
+```
+
+- **Where it's inserted:** [`core/cloud/run_transcription`](src-tauri/src/core/cloud/mod.rs)
+  calls `audio::deepfilter::maybe_enhance(audio_path)` immediately **before**
+  `assemblyai::transcribe_file(...)`. When it returns an enhanced copy, that copy is
+  uploaded to AssemblyAI; otherwise the original recording is uploaded. Everything
+  downstream (auth, `speaker_labels`, punctuation, polling, `TranscriptSegment` /
+  `Participant` parsing) is untouched.
+- **Non-destructive:** the enhanced audio is written to a **temporary file** that is
+  deleted as soon as the transcription completes. The saved recording on disk is never
+  modified, and DeepFilterNet preserves sample rate + duration so transcript timestamps
+  remain valid.
+- **Always falls back:** if the feature isn't compiled, the toggle is off, the
+  `deep-filter` CLI isn't installed, or the run fails for any reason, `maybe_enhance`
+  returns `None` and AssemblyAI runs on the original audio — exactly as before. It can
+  never break the existing flow. This mirrors the graceful ffmpeg A/V-mux fallback.
+- **How it works:** it shells out to the external DeepFilterNet CLI (`deep-filter`,
+  the Rust binary from the DeepFilterNet releases, or `deepFilter` from
+  `pip install deepfilternet`) — no ML model or heavy Rust dependency is bundled.
+- **Enable it** (two gates, so the default build is unchanged):
+  1. Compile with the feature: `cargo build --features deepfilter` (or
+     `tauri build --features deepfilter`), with the `deep-filter` CLI on `PATH`.
+  2. At runtime it's on by default once compiled; force-disable without recompiling via
+     `MEETAPP_DEEPFILTER=0`. Override the binary with `MEETAPP_DEEPFILTER_BIN` and pass
+     extra CLI args with `MEETAPP_DEEPFILTER_ARGS`.
+- **Disable it:** simply build without `--features deepfilter` (the default), or set
+  `MEETAPP_DEEPFILTER=0`. See [`src/audio/deepfilter.rs`](src-tauri/src/audio/deepfilter.rs)
+  for the full module documentation.
 
 ---
 

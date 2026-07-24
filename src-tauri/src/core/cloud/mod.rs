@@ -71,6 +71,11 @@ pub fn run_transcription(
 
     set_status(app, state, meeting_id, MeetingStatus::Processing);
 
+    // Noise suppression already happened ONCE, up front, at the single decision
+    // point in recording finalize (`audio::suppress_noise`: DeepFilterNet primary,
+    // RNNoise fallback — never both). The audio on disk IS the processed audio, so
+    // we transcribe it directly here. There is deliberately no second suppression
+    // pass in the transcription path.
     match assemblyai::transcribe_file(Path::new(&audio_path), &key) {
         Ok(tr) => {
             let updated = {
@@ -157,5 +162,57 @@ fn set_status(app: &AppHandle, state: &AppState, id: &str, status: MeetingStatus
     };
     if let Some(m) = updated {
         Events::updated(app, &m);
+    }
+}
+
+/// Live end-to-end verification against the real AssemblyAI API. Opt-in: does
+/// nothing unless `MEETAPP_LIVE_ASSEMBLYAI_TEST` is set (so normal `cargo test`
+/// never hits the network or spends API quota). Needs `ASSEMBLYAI_API_KEY` and
+/// `MEETAPP_DEEPFILTER_TEST_WAV`; with the `deepfilter` feature + a binary it also
+/// transcribes the enhanced audio, proving the DeepFilterNet → AssemblyAI chain.
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn live_transcribe_original_then_enhanced() {
+        if std::env::var("MEETAPP_LIVE_ASSEMBLYAI_TEST").is_err() {
+            eprintln!("SKIP: set MEETAPP_LIVE_ASSEMBLYAI_TEST=1 to run the live AssemblyAI check");
+            return;
+        }
+        let key = std::env::var("ASSEMBLYAI_API_KEY").expect("ASSEMBLYAI_API_KEY must be set");
+        let wav = std::env::var("MEETAPP_DEEPFILTER_TEST_WAV").expect("MEETAPP_DEEPFILTER_TEST_WAV must be set");
+        let orig = Path::new(&wav);
+
+        // 1) AssemblyAI on the ORIGINAL audio — proves the existing pipeline is
+        //    untouched and still transcribes.
+        let t1 = assemblyai::transcribe_file(orig, &key).expect("AssemblyAI (original) failed");
+        eprintln!(
+            "ORIGINAL : {} segment(s), {} speaker(s); first = {:?}",
+            t1.segments.len(),
+            t1.participants.len(),
+            t1.segments.first().map(|s| s.text.as_str())
+        );
+        assert!(!t1.segments.is_empty(), "original transcript must not be empty");
+
+        // 2) DeepFilterNet preprocessing → AssemblyAI on the ENHANCED audio —
+        //    proves the full optional chain end-to-end.
+        match crate::audio::deepfilter::maybe_enhance(orig) {
+            Some(enh) => {
+                let t2 = assemblyai::transcribe_file(enh.path(), &key)
+                    .expect("AssemblyAI (enhanced) failed");
+                eprintln!(
+                    "ENHANCED : {} segment(s), {} speaker(s); first = {:?}",
+                    t2.segments.len(),
+                    t2.participants.len(),
+                    t2.segments.first().map(|s| s.text.as_str())
+                );
+                assert!(!t2.segments.is_empty(), "enhanced transcript must not be empty");
+            }
+            None => eprintln!(
+                "ENHANCED : skipped (deepfilter feature off or binary unavailable) — \
+                 fallback path would transcribe the original, already verified above"
+            ),
+        }
     }
 }
