@@ -18,19 +18,22 @@
 //! dependencies, and means the app degrades gracefully to the original AssemblyAI
 //! flow whenever the tool isn't installed.
 //!
-//! ## Enabling it
-//! Two independent gates, so the default build is byte-for-byte unchanged:
-//!   1. **Compile time** — build with `--features deepfilter`. Without it, every
-//!      function here compiles to a no-op that returns `None` (→ original audio).
-//!   2. **Run time** — even when compiled in, it only runs when the DeepFilterNet
-//!      CLI is reachable. Toggle explicitly with the `MEETAPP_DEEPFILTER`
-//!      environment variable (`0`/`false`/`off` to force-disable; unset or
-//!      `1`/`true`/`on` to allow). The binary and extra CLI args are overridable
-//!      with `MEETAPP_DEEPFILTER_BIN` and `MEETAPP_DEEPFILTER_ARGS`.
+//! ## Enabling / disabling it
+//! **On by default** (the `deepfilter` Cargo feature is in the default set), so
+//! DeepFilterNet is the primary denoiser out of the box, with RNNoise as the
+//! automatic fallback. Controls:
+//!   * **Binary** — auto-discovered (next to the app executable, then
+//!     `~/deepfilter/`), or set `MEETAPP_DEEPFILTER_BIN` explicitly. If none is
+//!     found, the spawn fails and the pipeline falls back to RNNoise.
+//!   * **Run-time toggle** — `MEETAPP_DEEPFILTER=0` (`false`/`off`) forces it off,
+//!     so RNNoise handles suppression; unset or `1`/`on` keeps it primary.
+//!   * **Extra CLI args** — `MEETAPP_DEEPFILTER_ARGS`.
+//!   * **Compile out entirely** — build with `--no-default-features --features
+//!     mic-capture,denoise,screen-capture`; then every function here is a no-op.
 //!
 //! On *any* problem — feature off, env-disabled, binary missing, non-zero exit,
-//! no output produced — [`maybe_enhance`] returns `None` and the caller falls back
-//! to the untouched original audio. It can never break the existing pipeline.
+//! invalid/no output — the pipeline falls back to RNNoise (via
+//! [`crate::audio::suppress_noise`]). It can never break recording.
 
 use std::path::{Path, PathBuf};
 
@@ -159,8 +162,40 @@ fn enabled() -> bool {
 mod imp {
     use super::{Enhanced, DEFAULT_BIN};
     use crate::error::{AppError, AppResult};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+
+    /// Resolve the DeepFilterNet binary so it works out of the box, without env
+    /// setup: explicit `MEETAPP_DEEPFILTER_BIN` wins; otherwise try known install
+    /// locations (next to the app executable, then `~/deepfilter/`); otherwise fall
+    /// back to the bare command name for a normal PATH lookup. If none of these
+    /// resolve to a runnable binary, the spawn fails and the caller falls back to
+    /// RNNoise — so this never breaks recording, it just picks DeepFilterNet when
+    /// it's actually available.
+    fn resolve_binary() -> String {
+        if let Ok(b) = std::env::var("MEETAPP_DEEPFILTER_BIN") {
+            let b = b.trim();
+            if !b.is_empty() {
+                return b.to_string();
+            }
+        }
+        let exe_name = if cfg!(windows) { "deep-filter.exe" } else { "deep-filter" };
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join(exe_name));
+            }
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            candidates.push(PathBuf::from(home).join("deepfilter").join(exe_name));
+        }
+        for c in candidates {
+            if c.is_file() {
+                return c.to_string_lossy().into_owned();
+            }
+        }
+        DEFAULT_BIN.to_string() // rely on PATH
+    }
 
     /// Run DeepFilterNet over `input`, writing the enhanced result into a fresh
     /// temp directory and returning a handle to it. Errors (mapped to
@@ -181,7 +216,7 @@ mod imp {
         // Build:  <bin> [extra args] --output-dir <dir> <input>
         // Both the Rust `deep-filter` and Python `deepFilter` CLIs accept
         // `--output-dir` and positional input files.
-        let bin = std::env::var("MEETAPP_DEEPFILTER_BIN").unwrap_or_else(|_| DEFAULT_BIN.into());
+        let bin = resolve_binary();
         let mut cmd = Command::new(&bin);
         if let Ok(extra) = std::env::var("MEETAPP_DEEPFILTER_ARGS") {
             for arg in extra.split_whitespace() {

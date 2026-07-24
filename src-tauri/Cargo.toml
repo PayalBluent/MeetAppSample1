@@ -96,7 +96,13 @@ tauri-plugin-autostart = "2"
 # The default build uses only reliable, well-supported crates and is fully
 # functional: real meeting detection, real microphone recording (WAV), and a
 # built-in transcription/summary pipeline. Heavier native backends are opt-in.
-default = ["mic-capture", "denoise", "screen-capture"]
+#
+# `deepfilter` is included by default so DeepFilterNet is the primary denoiser
+# out of the box. It adds NO Rust dependency (it shells out to the external
+# `deep-filter` CLI) and degrades gracefully: if the CLI isn't installed or fails,
+# the pipeline automatically falls back to RNNoise. So a default build with no
+# `deep-filter` binary behaves exactly like the old RNNoise-only pipeline.
+default = ["mic-capture", "denoise", "screen-capture", "deepfilter"]
 
 # cpal is now a non-optional dependency; this feature is retained as a no-op so
 # older build invocations and the existing `#[cfg(feature = "mic-capture")]`
@@ -125,14 +131,14 @@ screen-capture = ["dep:windows-capture"]
 # cloud AssemblyAI backend; needs a C/C++ toolchain + CMake).
 whisper = ["dep:whisper-rs"]
 
-# Optional DeepFilterNet noise-suppression *preprocessing* in front of the
-# AssemblyAI transcription pipeline. Off by default so the shipped build is
-# unchanged. Adds no Rust dependency: it shells out to the external DeepFilterNet
-# CLI (`deep-filter`), exactly like the optional ffmpeg A/V mux, and falls back to
-# the original audio whenever the tool is missing or fails. Build with:
-#   cargo build --features deepfilter   (needs the `deep-filter` CLI on PATH)
-# Runtime knobs: MEETAPP_DEEPFILTER (0/1), MEETAPP_DEEPFILTER_BIN,
-# MEETAPP_DEEPFILTER_ARGS. See `src/audio/deepfilter.rs`.
+# DeepFilterNet noise suppression — the PRIMARY denoiser (RNNoise is the fallback).
+# On by default (see the `default` list). Adds no Rust dependency: it shells out to
+# the external DeepFilterNet CLI (`deep-filter`), exactly like the optional ffmpeg
+# A/V mux, and falls back to RNNoise whenever the tool is missing or fails. The
+# binary is auto-discovered (next to the app, then ~/deepfilter) or set explicitly.
+# Runtime knobs: MEETAPP_DEEPFILTER (0 disables → RNNoise), MEETAPP_DEEPFILTER_BIN,
+# MEETAPP_DEEPFILTER_ARGS. To build WITHOUT it: `--no-default-features --features
+# mic-capture,denoise,screen-capture`. See `src/audio/deepfilter.rs`.
 deepfilter = []
 
 [profile.release]
