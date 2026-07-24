@@ -440,14 +440,26 @@ fn maybe_denoise(mono48: Vec<f32>, enabled: bool, gate: bool) -> Vec<f32> {
     }
 }
 
-/// Enhance a recorded WAV **in place** so quiet recordings become clearly audible.
+/// Enhance a recorded WAV **in place** so quiet recordings become clearly audible,
+/// **without amplifying the noise floor** — robust across quiet and noisy rooms.
 ///
-/// Measures the recording's RMS (average) level and applies the single gain needed
-/// to bring it to a loud, clear target ([`TARGET_RMS`]). A memory-less **soft
-/// limiter** rounds off only the occasional peak that would exceed full scale, so
-/// the body of the speech is scaled purely linearly — louder, never distorted, and
-/// (unlike an adaptive AGC) mathematically incapable of collapsing the signal.
-/// Only ever boosts, never attenuates; a no-op on silence.
+/// Applies a single boost-only gain toward a loud, clear target ([`TARGET_RMS`]),
+/// then a memory-less **soft limiter** rounds off only the occasional peak that
+/// would exceed full scale, so speech is scaled linearly — louder, never distorted.
+///
+/// The gain is chosen **adaptively** from two measurements of the signal, so it
+/// behaves sensibly wherever the app is used:
+///   * a **noise floor** (10th-percentile short-window RMS — the quiet gaps), and
+///   * a **speech level** (90th-percentile short-window RMS — the loud parts).
+///
+/// When those are clearly separated (real speech sitting above a noise floor), the
+/// boost is additionally capped so the *post-gain noise floor stays below*
+/// [`NOISE_CEILING`]. This is what stops a **quiet room / soft speaker** from being
+/// pumped into a wall of hiss, while a **busy/noisy** recording (already cleaned by
+/// DeepFilterNet upstream) is still lifted but never has its residual noise
+/// amplified. When there's no clear separation (a near-constant signal), it falls
+/// back to the plain target-loudness boost, so it never *under*-boosts genuine
+/// quiet speech. Only ever boosts, never attenuates; a no-op on silence.
 ///
 /// Down-mixes to mono (meeting audio is speech — mono is the most-audible form and
 /// best for transcription).
@@ -458,6 +470,16 @@ pub fn normalize_wav_file(path: &Path) -> AppResult<()> {
     const MAX_GAIN: f32 = 12.0;
     /// Soft-limiter knee — samples below this are passed through untouched.
     const KNEE: f32 = 0.95;
+    /// Ceiling the post-gain noise floor must stay under (≈ −40 dBFS) when a real
+    /// speech-above-noise separation is detected — keeps quiet rooms from pumping.
+    const NOISE_CEILING: f32 = 0.01;
+    /// Speech must exceed this ×noise-floor to count as "speech above a noise
+    /// floor" (i.e. a bimodal signal). Below it the signal is treated as uniform
+    /// and the noise-floor cap is not applied (so a soft, gap-free voice or a test
+    /// tone is still boosted normally).
+    const SEPARATION: f32 = 3.0;
+    /// Short analysis window for the percentile measurements (20 ms @ any rate).
+    const WINDOW_MS: usize = 20;
 
     let reader = hound::WavReader::open(path).map_err(|e| AppError::Audio(e.to_string()))?;
     let spec = reader.spec();
@@ -495,10 +517,34 @@ pub fn normalize_wav_file(path: &Path) -> AppResult<()> {
         return Ok(()); // silence — nothing to enhance
     }
 
-    // One gain to reach the target loudness (boost-only, capped).
-    let gain = (TARGET_RMS / rms).clamp(1.0, MAX_GAIN);
+    // Base gain: bring overall loudness to the target (boost-only, capped). This is
+    // the original behavior and the fallback when there's no clear noise floor.
+    let mut gain = (TARGET_RMS / rms).clamp(1.0, MAX_GAIN);
+
+    // Adaptive part: measure the noise floor and speech level from short-window
+    // RMS percentiles. Only when speech clearly sits above a noise floor do we cap
+    // the boost so the post-gain noise floor stays under NOISE_CEILING — this is
+    // what keeps a quiet room / soft speaker from being pumped into audible hiss.
+    let win = (spec.sample_rate as usize * WINDOW_MS / 1000).max(1);
+    let mut windows: Vec<f32> = mono
+        .chunks(win)
+        .map(|w| (w.iter().map(|s| s * s).sum::<f32>() / w.len() as f32).sqrt())
+        .collect();
+    let (noise_floor, speech_level) = if windows.len() >= 4 {
+        windows.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pct = |p: f32| windows[((windows.len() as f32 * p) as usize).min(windows.len() - 1)];
+        (pct(0.10), pct(0.90))
+    } else {
+        (rms, rms) // too short to profile — treat as uniform (no cap)
+    };
+    if noise_floor > 1e-6 && speech_level > SEPARATION * noise_floor {
+        let noise_cap = (NOISE_CEILING / noise_floor).max(1.0); // never attenuate
+        gain = gain.min(noise_cap);
+    }
+
     tracing::info!(
-        "enhance {path:?}: rms={rms:.4} peak={peak:.4} -> gain x{gain:.2}"
+        "enhance {path:?}: rms={rms:.4} peak={peak:.4} noise={noise_floor:.4} \
+         speech={speech_level:.4} -> gain x{gain:.2}"
     );
     for s in mono.iter_mut() {
         *s = soft_limit(*s * gain, KNEE);
@@ -787,6 +833,65 @@ mod normalize_tests {
         );
         // ...but never clipping.
         assert!(after_peak <= 1.0, "must never clip, got peak {after_peak}");
+    }
+
+    /// Robustness: on a bimodal recording (a quiet, audible noise floor with a
+    /// louder speech burst) the adaptive AGC must NOT pump the noise floor up. The
+    /// old fixed-target AGC multiplied the whole file by the loudness gain, tripling
+    /// the noise region; the noise-aware cap keeps the quiet region roughly where it
+    /// was. This is the quiet-room / soft-speaker real-world case.
+    #[test]
+    fn does_not_pump_noise_floor_in_bimodal_recording() {
+        let dir = std::env::temp_dir().join("meetapp-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("normalize-bimodal.wav");
+        let _ = std::fs::remove_file(&path);
+
+        let fs = 48_000usize;
+        let n = fs * 2; // 2 s
+        // A steady, clearly-audible noise floor (~0.03) everywhere, with a louder
+        // speech-like tone burst added over the middle third.
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: fs as u32,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        {
+            let mut w = hound::WavWriter::create(&path, spec).unwrap();
+            for i in 0..n {
+                let noise = (i as f32 * 0.02).sin() * 0.03;
+                let speech = if i >= n / 3 && i < 2 * n / 3 {
+                    (i as f32 * 0.11).sin() * 0.12
+                } else {
+                    0.0
+                };
+                w.write_sample(((noise + speech).clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                    .unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        // Noise floor before = RMS of the quiet first third.
+        let region_rms = |path: &Path, frac_lo: f32, frac_hi: f32| -> f32 {
+            let s: Vec<f32> = hound::WavReader::open(path)
+                .unwrap()
+                .into_samples::<i16>()
+                .filter_map(Result::ok)
+                .map(|s| s as f32 / 32_768.0)
+                .collect();
+            let (lo, hi) = ((s.len() as f32 * frac_lo) as usize, (s.len() as f32 * frac_hi) as usize);
+            (s[lo..hi].iter().map(|x| x * x).sum::<f32>() / (hi - lo) as f32).sqrt()
+        };
+        let noise_before = region_rms(&path, 0.0, 0.30);
+
+        normalize_wav_file(&path).expect("normalize should succeed");
+
+        let noise_after = region_rms(&path, 0.0, 0.30);
+        assert!(
+            noise_after <= noise_before * 1.5,
+            "noise floor must not be pumped: {noise_before:.4} -> {noise_after:.4}"
+        );
     }
 
     fn wav_stats(path: &Path) -> (f32, f32) {
